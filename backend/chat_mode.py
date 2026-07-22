@@ -18,3 +18,10 @@ def get_tableau_chat_mode() -> TableauChatMode:
 
 def is_workbook_mode() -> bool:
     return get_tableau_chat_mode() == "workbook"
+
+
+def uses_datasource_tools(*, has_selected_datasources: bool = False) -> bool:
+    """Datasource MCP tools when in datasource mode, or when the extension scoped datasources."""
+    if has_selected_datasources:
+        return True
+    return not is_workbook_mode()

@@ -52,7 +52,7 @@ def _parse_workbook_row(raw: Any) -> WorkbookSummary | None:
     )
 
 
-def _extract_json_payload(text: str) -> Any:
+def _extract_json_payload(text: str) -> Any:  # used by datasources module too
     trimmed = text.strip()
     if not trimmed:
         return None

@@ -1,8 +1,24 @@
 /** Minimal Tableau Extensions API types used by this app. */
+interface TableauDataSource {
+  readonly id: string;
+  readonly name: string;
+  readonly isPublished?: boolean;
+}
+
+interface TableauWorksheet {
+  readonly name: string;
+  getDataSourcesAsync(): Promise<TableauDataSource[]>;
+}
+
+interface TableauWorkbook {
+  readonly name: string;
+  getAllDataSourcesAsync?: () => Promise<TableauDataSource[]>;
+}
+
 interface TableauDashboard {
   readonly name: string;
-  readonly workbook: { readonly name: string };
-  readonly worksheets: ReadonlyArray<{ readonly name: string }>;
+  readonly workbook: TableauWorkbook;
+  readonly worksheets: ReadonlyArray<TableauWorksheet>;
 }
 
 interface TableauSettings {

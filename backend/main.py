@@ -19,6 +19,11 @@ from pydantic import BaseModel
 from backend.chat import run_agent_turn
 from backend.chat_mode import get_tableau_chat_mode
 from backend.config import env
+from backend.datasources import (
+    DatasourceSummary,
+    fetch_workbook_published_datasources,
+    resolve_datasources_via_mcp,
+)
 from backend.runner import run_exclusive
 from backend.tableau_fields import (
     check_metadata_api_access,
@@ -50,9 +55,17 @@ class SelectedWorkbookBody(BaseModel):
     defaultViewId: Optional[str] = None
 
 
+class SelectedDatasourceBody(BaseModel):
+    id: Optional[str] = None
+    name: str
+    projectName: Optional[str] = None
+    isPublished: Optional[bool] = None
+
+
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
     selectedWorkbook: Optional[SelectedWorkbookBody] = None
+    selectedDatasources: Optional[list[SelectedDatasourceBody]] = None
     extensionMode: Optional[bool] = None
 
 
@@ -70,6 +83,33 @@ def _parse_workbook(body: Optional[SelectedWorkbookBody]) -> Optional[SelectedWo
         project_name=body.projectName,
         default_view_id=body.defaultViewId,
     )
+
+
+def _parse_datasources(
+    bodies: Optional[list[SelectedDatasourceBody]],
+) -> list[DatasourceSummary]:
+    if not bodies:
+        return []
+    out: list[DatasourceSummary] = []
+    seen: set[str] = set()
+    for body in bodies:
+        name = (body.name or "").strip()
+        if not name:
+            continue
+        did = (body.id or "").strip()
+        key = did or f"name:{name.casefold()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            DatasourceSummary(
+                id=did,
+                name=name,
+                project_name=body.projectName,
+                is_published=body.isPublished,
+            )
+        )
+    return out
 
 
 app = FastAPI(title="Tableau MCP Chat", version="0.2.0")
@@ -154,6 +194,65 @@ async def api_resolve_workbook(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/datasources/resolve")
+async def api_resolve_datasources(
+    names: Optional[str] = Query(None, description="Comma-separated datasource names"),
+    workbookId: Optional[str] = Query(None),
+) -> dict[str, Any]:
+    """Resolve published datasource LUIDs by name and/or workbook Metadata upstreams."""
+    name_list = [n.strip() for n in (names or "").split(",") if n.strip()]
+    wid = (workbookId or "").strip()
+    if not name_list and not wid:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide query parameter names= and/or workbookId=",
+        )
+
+    try:
+
+        async def _run() -> list[dict[str, Any]]:
+            await get_mcp_client(force_datasource_tools=True)
+            matched: list[DatasourceSummary] = []
+
+            if name_list:
+                matched = await resolve_datasources_via_mcp(names=name_list)
+
+            if wid and not matched:
+                meta = fetch_workbook_published_datasources(wid)
+                published = [d for d in meta if d.id]
+                if published:
+                    matched = published
+                elif name_list:
+                    # keep empty — names didn't resolve
+                    matched = []
+                else:
+                    matched = meta
+
+            # Enrich name-only rows via MCP if we got names from metadata without LUID
+            if wid and matched and any(not d.id for d in matched):
+                names_missing = [d.name for d in matched if not d.id]
+                if names_missing:
+                    resolved = await resolve_datasources_via_mcp(names=names_missing)
+                    by_name = {d.name.casefold(): d for d in resolved}
+                    enriched: list[DatasourceSummary] = []
+                    for d in matched:
+                        if d.id:
+                            enriched.append(d)
+                        else:
+                            hit = by_name.get(d.name.casefold())
+                            enriched.append(hit or d)
+                    matched = enriched
+
+            return [d.to_api_dict() for d in matched]
+
+        datasources = await run_exclusive(_run)
+        return {"datasources": datasources}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/api/workbooks")
 async def api_workbooks() -> dict[str, Any]:
     import logging
@@ -210,6 +309,7 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
         )
 
     workbook = _parse_workbook(body.selectedWorkbook)
+    datasources = _parse_datasources(body.selectedDatasources)
     normalized: list[dict[str, str]] = []
     for m in body.messages:
         if m.role not in ("user", "assistant"):
@@ -221,10 +321,29 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
     extension_mode = body.extensionMode is True
 
     async def _run():
+        scoped = list(datasources)
+        # Extension: if client sent names without LUIDs, resolve against published datasources.
+        if scoped and any(not d.id for d in scoped):
+            await get_mcp_client(force_datasource_tools=True)
+            names = [d.name for d in scoped]
+            resolved = await resolve_datasources_via_mcp(names=names)
+            if resolved:
+                scoped = resolved
+            elif workbook and workbook.id:
+                meta = fetch_workbook_published_datasources(workbook.id)
+                if meta:
+                    scoped = [d for d in meta if d.id] or meta
+        elif extension_mode and not scoped and workbook and workbook.id:
+            await get_mcp_client(force_datasource_tools=True)
+            meta = fetch_workbook_published_datasources(workbook.id)
+            if meta:
+                scoped = [d for d in meta if d.id] or meta
+
         return await run_agent_turn(
             openai_client,
             normalized,
             workbook,
+            scoped or None,
             extension_mode=extension_mode,
         )
 

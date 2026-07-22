@@ -51,8 +51,8 @@ export function App() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const isWorkbookMode = health?.chatMode !== "datasource";
   const selectedWorkbook = extensionContext?.workbook ?? null;
+  const selectedDatasources = extensionContext?.datasources ?? [];
 
   useEffect(() => {
     fetch(apiUrl("/api/health"))
@@ -108,7 +108,7 @@ export function App() {
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed || loading) return;
-      if (isWorkbookMode && !selectedWorkbook) {
+      if (!selectedWorkbook) {
         setError("Connecting…");
         return;
       }
@@ -125,7 +125,17 @@ export function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             messages: next.map((m) => ({ role: m.role, content: m.content })),
-            ...(selectedWorkbook ? { selectedWorkbook } : {}),
+            selectedWorkbook,
+            ...(selectedDatasources.length > 0
+              ? {
+                  selectedDatasources: selectedDatasources.map((d) => ({
+                    id: d.id || undefined,
+                    name: d.name,
+                    projectName: d.projectName,
+                    isPublished: d.isPublished,
+                  })),
+                }
+              : {}),
             extensionMode: true,
           }),
         });
@@ -154,7 +164,7 @@ export function App() {
         textareaRef.current?.focus();
       }
     },
-    [loading, messages, isWorkbookMode, selectedWorkbook]
+    [loading, messages, selectedWorkbook, selectedDatasources]
   );
 
   const send = useCallback(() => void sendMessage(input), [input, sendMessage]);
@@ -172,7 +182,7 @@ export function App() {
     }
   };
 
-  const workbookReady = !isWorkbookMode || !!selectedWorkbook;
+  const workbookReady = !!selectedWorkbook;
   const canSend = !loading && !!input.trim() && health?.ok && workbookReady && !workbookLoading;
 
   const statusMessage = (() => {
@@ -184,6 +194,10 @@ export function App() {
       if (health.tableauSignInOk === false && health.tableauHint) return health.tableauHint;
       if (!health.hasOpenAi) return "Set OPENAI_API_KEY on the server";
       return "Set Tableau PAT on the server";
+    }
+    if (selectedWorkbook && selectedDatasources.length > 0) {
+      const n = selectedDatasources.length;
+      return `Connected · ${n} datasource${n === 1 ? "" : "s"}`;
     }
     if (selectedWorkbook) {
       return "Connected";
@@ -227,7 +241,6 @@ export function App() {
         <main className="messages" role="log" aria-live="polite" aria-relevant="additions">
           {messages.length === 0 &&
             !loading &&
-            isWorkbookMode &&
             !selectedWorkbook &&
             health?.ok &&
             !workbookLoading && (

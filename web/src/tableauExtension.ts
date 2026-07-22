@@ -9,8 +9,16 @@ export type WorkbookSummary = {
   defaultViewId?: string;
 };
 
+export type DatasourceSummary = {
+  id: string;
+  name: string;
+  projectName?: string;
+  isPublished?: boolean;
+};
+
 export type ExtensionContext = {
   workbook: WorkbookSummary;
+  datasources: DatasourceSummary[];
   dashboardName: string;
   worksheetNames: string[];
   source:
@@ -63,6 +71,88 @@ async function resolveWorkbook(options: {
     throw new Error(data.detail ?? "Could not resolve workbook on the server.");
   }
   return data.workbook;
+}
+
+async function resolveDatasources(options: {
+  names?: string[];
+  workbookId?: string;
+}): Promise<DatasourceSummary[]> {
+  const qs = new URLSearchParams();
+  if (options.names?.length) qs.set("names", options.names.join(","));
+  if (options.workbookId) qs.set("workbookId", options.workbookId);
+  if (![...qs.keys()].length) return [];
+  try {
+    const res = await fetch(apiUrl(`/api/datasources/resolve?${qs}`));
+    if (!res.ok) return [];
+    const data = await readJson<{ datasources?: DatasourceSummary[] }>(res);
+    return Array.isArray(data.datasources) ? data.datasources : [];
+  } catch {
+    return [];
+  }
+}
+
+async function collectTableauDatasources(dashboard: TableauDashboard): Promise<
+  Array<{ name: string; isPublished?: boolean }>
+> {
+  const byName = new Map<string, { name: string; isPublished?: boolean }>();
+
+  const workbook = dashboard.workbook;
+  if (typeof workbook.getAllDataSourcesAsync === "function") {
+    try {
+      const all = await workbook.getAllDataSourcesAsync();
+      for (const ds of all) {
+        if (!ds?.name) continue;
+        byName.set(ds.name, {
+          name: ds.name,
+          isPublished: typeof ds.isPublished === "boolean" ? ds.isPublished : undefined,
+        });
+      }
+    } catch {
+      /* fall through to worksheets */
+    }
+  }
+
+  if (byName.size === 0) {
+    const results = await Promise.all(
+      dashboard.worksheets.map(async (ws) => {
+        try {
+          return await ws.getDataSourcesAsync();
+        } catch {
+          return [] as TableauDataSource[];
+        }
+      })
+    );
+    for (const list of results) {
+      for (const ds of list) {
+        if (!ds?.name) continue;
+        byName.set(ds.name, {
+          name: ds.name,
+          isPublished: typeof ds.isPublished === "boolean" ? ds.isPublished : undefined,
+        });
+      }
+    }
+  }
+
+  return [...byName.values()];
+}
+
+async function attachDatasources(
+  workbook: WorkbookSummary,
+  detected: Array<{ name: string; isPublished?: boolean }> = []
+): Promise<DatasourceSummary[]> {
+  const names = detected.map((d) => d.name);
+  const resolved = await resolveDatasources({
+    names: names.length ? names : undefined,
+    workbookId: workbook.id,
+  });
+  if (resolved.length > 0) return resolved;
+
+  // Fall back to detected names without server LUID (chat will try resolve again)
+  return detected.map((d) => ({
+    id: "",
+    name: d.name,
+    isPublished: d.isPublished,
+  }));
 }
 
 /**
@@ -158,7 +248,8 @@ async function resolveByContentUrl(
   if (cachedId) {
     try {
       const workbook = await resolveWorkbook({ workbookId: cachedId });
-      return extensionContextWithoutApi(workbook, contentUrl, source);
+      const datasources = await attachDatasources(workbook);
+      return extensionContextWithoutApi(workbook, contentUrl, source, datasources);
     } catch {
       /* stale session cache */
     }
@@ -166,7 +257,8 @@ async function resolveByContentUrl(
 
   const workbook = await resolveWorkbook({ contentUrl });
   writeSessionWorkbookId(contentUrl, workbook.id);
-  return extensionContextWithoutApi(workbook, contentUrl, source);
+  const datasources = await attachDatasources(workbook);
+  return extensionContextWithoutApi(workbook, contentUrl, source, datasources);
 }
 
 function contentUrlCandidatesFromName(name: string): string[] {
@@ -225,10 +317,12 @@ async function persistWorkbookContext(
 function extensionContextFromDashboard(
   dashboard: TableauDashboard,
   workbook: WorkbookSummary,
-  source: ExtensionContext["source"]
+  source: ExtensionContext["source"],
+  datasources: DatasourceSummary[] = []
 ): ExtensionContext {
   return {
     workbook,
+    datasources,
     dashboardName: dashboard.name,
     worksheetNames: dashboard.worksheets.map((w) => w.name),
     source,
@@ -238,10 +332,12 @@ function extensionContextFromDashboard(
 function extensionContextWithoutApi(
   workbook: WorkbookSummary,
   dashboardName: string,
-  source: ExtensionContext["source"]
+  source: ExtensionContext["source"],
+  datasources: DatasourceSummary[] = []
 ): ExtensionContext {
   return {
     workbook,
+    datasources,
     dashboardName,
     worksheetNames: [],
     source,
@@ -273,6 +369,7 @@ async function loadFromTableauApi(
   const settings = api.settings;
   const tableauWorkbookName = dashboard.workbook.name;
   const detectedContentUrl = parseContentUrlFromDashboardHints();
+  const detectedDatasources = await collectTableauDatasources(dashboard);
 
   const storedId = sanitizeParam(settings.get(SETTINGS_WORKBOOK_ID) ?? null);
   const storedName = sanitizeParam(settings.get(SETTINGS_WORKBOOK_NAME) ?? null);
@@ -285,7 +382,8 @@ async function loadFromTableauApi(
   if (storedId && cacheKeyMatches) {
     try {
       const workbook = await resolveWorkbook({ workbookId: storedId });
-      return extensionContextFromDashboard(dashboard, workbook, "settings");
+      const datasources = await attachDatasources(workbook, detectedDatasources);
+      return extensionContextFromDashboard(dashboard, workbook, "settings", datasources);
     } catch {
       /* stale cache */
     }
@@ -295,7 +393,13 @@ async function loadFromTableauApi(
     try {
       const workbook = await resolveWorkbook({ contentUrl: detectedContentUrl });
       await persistWorkbookContext(settings, workbook, tableauWorkbookName, detectedContentUrl);
-      return extensionContextFromDashboard(dashboard, workbook, "referrer-contentUrl");
+      const datasources = await attachDatasources(workbook, detectedDatasources);
+      return extensionContextFromDashboard(
+        dashboard,
+        workbook,
+        "referrer-contentUrl",
+        datasources
+      );
     } catch {
       /* try name resolve */
     }
@@ -311,38 +415,52 @@ async function loadFromTableauApi(
     tableauWorkbookName,
     workbook.contentUrl ?? detectedContentUrl ?? undefined
   );
-  return extensionContextFromDashboard(dashboard, workbook, source);
+  const datasources = await attachDatasources(workbook, detectedDatasources);
+  return extensionContextFromDashboard(dashboard, workbook, source, datasources);
 }
 
 async function loadFromTableauHost(test: ReturnType<typeof testParamsFromQuery>): Promise<ExtensionContext> {
   if (test.workbookId) {
     const workbook = await resolveWorkbook({ workbookId: test.workbookId });
-    return extensionContextWithoutApi(workbook, "Dashboard", "query");
+    const datasources = await attachDatasources(workbook);
+    return extensionContextWithoutApi(workbook, "Dashboard", "query", datasources);
   }
 
   if (test.contentUrl) {
     return resolveByContentUrl(test.contentUrl, "query");
   }
 
-  // Dynamic: dashboard URL slug and Tableau API run in parallel — first success wins.
-  const strategies: Promise<ExtensionContext>[] = [
-    loadFromDashboardUrl(test),
+  // Prefer Tableau API when it yields datasources; URL slug is the fallback.
+  const results = await Promise.allSettled([
     loadFromTableauApi(test),
-  ];
-
-  try {
-    return await Promise.any(strategies);
-  } catch {
+    loadFromDashboardUrl(test),
+  ]);
+  const contexts = results
+    .filter((r): r is PromiseFulfilledResult<ExtensionContext> => r.status === "fulfilled")
+    .map((r) => r.value);
+  if (contexts.length === 0) {
     throw new Error(
       "Could not detect workbook for this dashboard. Allowlist https://mcp-test-ldxl.onrender.com on Tableau Server (site demo), then reload."
     );
   }
+  return (
+    contexts.find((c) => c.datasources.length > 0) ??
+    contexts.find((c) => c.source !== "referrer-contentUrl") ??
+    contexts[0]
+  );
 }
 
 async function loadFromLocalTest(test: ReturnType<typeof testParamsFromQuery>): Promise<ExtensionContext> {
   if (test.workbookId) {
     const workbook = await resolveWorkbook({ workbookId: test.workbookId });
-    return { workbook, dashboardName: "Test dashboard", worksheetNames: [], source: "query" };
+    const datasources = await attachDatasources(workbook);
+    return {
+      workbook,
+      datasources,
+      dashboardName: "Test dashboard",
+      worksheetNames: [],
+      source: "query",
+    };
   }
   if (test.contentUrl) {
     return resolveByContentUrl(test.contentUrl, "query");
@@ -352,7 +470,14 @@ async function loadFromLocalTest(test: ReturnType<typeof testParamsFromQuery>): 
       test.workbookName,
       test.projectName ?? undefined
     );
-    return { workbook, dashboardName: "Test dashboard", worksheetNames: [], source };
+    const datasources = await attachDatasources(workbook);
+    return {
+      workbook,
+      datasources,
+      dashboardName: "Test dashboard",
+      worksheetNames: [],
+      source,
+    };
   }
 
   const contentUrl = await detectDashboardContentUrl(test);

@@ -11,12 +11,15 @@ from backend.chat_mode import (
     LOCAL_DATASOURCE_FIELDS_TOOL,
     get_tableau_chat_mode,
     is_workbook_mode,
+    uses_datasource_tools,
 )
 from backend.config import env
+from backend.datasources import SelectedDatasource
 from backend.mcp_tableau import call_tool, list_tools, tool_result_to_text
 from backend.prompts import (
     DATASOURCE_ANALYST_SYSTEM,
     WORKBOOK_ANALYST_SYSTEM,
+    datasource_selection_prompt_block,
     workbook_selection_prompt_block,
 )
 from backend.redact import redact_tableau_secrets
@@ -96,12 +99,24 @@ class AgentTurnResult:
 
 def _build_system_prompt(
     selected_workbook: SelectedWorkbook | None = None,
+    selected_datasources: list[SelectedDatasource] | None = None,
     *,
     extension_mode: bool = False,
 ) -> str:
-    base = WORKBOOK_ANALYST_SYSTEM if is_workbook_mode() else DATASOURCE_ANALYST_SYSTEM
-    parts = [base, f"Active mode: {get_tableau_chat_mode()}."]
-    if selected_workbook and is_workbook_mode():
+    datasource_scope = bool(selected_datasources)
+    use_ds = uses_datasource_tools(has_selected_datasources=datasource_scope)
+    base = DATASOURCE_ANALYST_SYSTEM if use_ds else WORKBOOK_ANALYST_SYSTEM
+    mode_label = "datasource" if use_ds else get_tableau_chat_mode()
+    parts = [base, f"Active mode: {mode_label}."]
+    if datasource_scope:
+        parts.append(
+            datasource_selection_prompt_block(
+                selected_datasources or [],
+                workbook=selected_workbook,
+                extension_mode=extension_mode,
+            )
+        )
+    elif selected_workbook and is_workbook_mode():
         parts.append(
             workbook_selection_prompt_block(selected_workbook, extension_mode=extension_mode)
         )
@@ -139,8 +154,8 @@ def _looks_like_error(text: str) -> bool:
     )
 
 
-async def mcp_tools_to_openai() -> list[dict[str, Any]]:
-    tools = await list_tools()
+async def mcp_tools_to_openai(*, force_datasource_tools: bool = False) -> list[dict[str, Any]]:
+    tools = await list_tools(force_datasource_tools=force_datasource_tools)
     out: list[dict[str, Any]] = []
     for t in tools:
         if not isinstance(t, dict):
@@ -165,15 +180,24 @@ async def mcp_tools_to_openai() -> list[dict[str, Any]]:
     return out
 
 
-def merge_chat_tools(mcp_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if is_workbook_mode():
+def merge_chat_tools(
+    mcp_tools: list[dict[str, Any]],
+    *,
+    force_datasource_tools: bool = False,
+) -> list[dict[str, Any]]:
+    if not uses_datasource_tools(has_selected_datasources=force_datasource_tools):
         return mcp_tools
     if env("DISABLE_LOCAL_DATASOURCE_FIELD_TOOL") == "1":
         return mcp_tools
     return [*mcp_tools, LOCAL_DATASOURCE_FIELDS_DEF]
 
 
-async def _execute_tool(name: str, args: dict[str, Any]) -> str:
+async def _execute_tool(
+    name: str,
+    args: dict[str, Any],
+    *,
+    force_datasource_tools: bool = False,
+) -> str:
     if name == LOCAL_DATASOURCE_FIELDS_TOOL:
         ident = str(args.get("identifier") or "").strip()
         if not ident:
@@ -184,7 +208,7 @@ async def _execute_tool(name: str, args: dict[str, Any]) -> str:
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    raw = await call_tool(name, args)
+    raw = await call_tool(name, args, force_datasource_tools=force_datasource_tools)
     return tool_result_to_text(raw)
 
 
@@ -215,15 +239,20 @@ async def run_agent_turn(
     openai_client: OpenAI,
     user_messages: list[dict[str, str]],
     selected_workbook: SelectedWorkbook | None = None,
+    selected_datasources: list[SelectedDatasource] | None = None,
     *,
     extension_mode: bool = False,
 ) -> AgentTurnResult:
     turn_start = time.time()
     open_ai_ms = 0
     tools_ms = 0
+    force_ds = bool(selected_datasources)
 
     t_setup = time.time()
-    tools = merge_chat_tools(await mcp_tools_to_openai())
+    tools = merge_chat_tools(
+        await mcp_tools_to_openai(force_datasource_tools=force_ds),
+        force_datasource_tools=force_ds,
+    )
     setup_ms = int((time.time() - t_setup) * 1000)
 
     messages: list[dict[str, Any]] = [
@@ -231,6 +260,7 @@ async def run_agent_turn(
             "role": "system",
             "content": _build_system_prompt(
                 selected_workbook,
+                selected_datasources,
                 extension_mode=extension_mode,
             ),
         },
@@ -286,7 +316,9 @@ async def run_agent_turn(
 
             t0 = time.time()
             try:
-                result_text = await _execute_tool(name, args)
+                result_text = await _execute_tool(
+                    name, args, force_datasource_tools=force_ds
+                )
             except Exception as e:
                 result_text = json.dumps({"error": str(e)})
             duration_ms = int((time.time() - t0) * 1000)

@@ -15,10 +15,10 @@ _client: McpStdioClient | None = None
 _mcp_env_fp: tuple[str, ...] | None = None
 _init_lock = asyncio.Lock()
 
-_MCP_TABLEAU_KEYS = ("SERVER", "SITE_NAME", "PAT_NAME", "PAT_VALUE")
+_MCP_TABLEAU_KEYS = ("SERVER", "SITE_NAME", "PAT_NAME", "PAT_VALUE", "EXCLUDE_TOOLS", "INCLUDE_TOOLS")
 
 
-def _build_mcp_env() -> dict[str, str]:
+def _build_mcp_env(*, force_datasource_tools: bool = False) -> dict[str, str]:
     mcp_env = {k: v for k, v in os.environ.items() if isinstance(v, str)}
     mcp_env["SERVER"] = require_env("TABLEAU_SERVER")
     # Tableau MCP reads SITE_NAME; empty string = default site.
@@ -30,8 +30,9 @@ def _build_mcp_env() -> dict[str, str]:
 
     include_tools = env("INCLUDE_TOOLS")
     enable_metadata = env("ENABLE_DATASOURCE_METADATA_TOOL") == "1"
+    workbook_only = is_workbook_mode() and not force_datasource_tools
 
-    if is_workbook_mode() and not include_tools:
+    if workbook_only and not include_tools:
         parts = [p.strip() for p in env("EXCLUDE_TOOLS").split(",") if p.strip()]
         for g in WORKBOOK_MODE_EXCLUDE_GROUPS:
             if g not in parts:
@@ -50,14 +51,14 @@ def _build_mcp_env() -> dict[str, str]:
     return mcp_env
 
 
-def _mcp_env_fingerprint() -> tuple[str, ...]:
-    e = _build_mcp_env()
+def _mcp_env_fingerprint(*, force_datasource_tools: bool = False) -> tuple[str, ...]:
+    e = _build_mcp_env(force_datasource_tools=force_datasource_tools)
     return tuple(e.get(k, "") for k in _MCP_TABLEAU_KEYS)
 
 
 def mcp_tableau_env_summary() -> dict[str, str]:
     e = _build_mcp_env()
-    return {k: e.get(k, "") for k in _MCP_TABLEAU_KEYS}
+    return {k: e.get(k, "") for k in ("SERVER", "SITE_NAME", "PAT_NAME", "PAT_VALUE")}
 
 
 async def reset_mcp_client() -> None:
@@ -69,9 +70,9 @@ async def reset_mcp_client() -> None:
         _mcp_env_fp = None
 
 
-async def get_mcp_client() -> McpStdioClient:
+async def get_mcp_client(*, force_datasource_tools: bool = False) -> McpStdioClient:
     global _client, _mcp_env_fp
-    fp = _mcp_env_fingerprint()
+    fp = _mcp_env_fingerprint(force_datasource_tools=force_datasource_tools)
     async with _init_lock:
         if _client is not None and _mcp_env_fp != fp:
             await _client.close()
@@ -80,7 +81,7 @@ async def get_mcp_client() -> McpStdioClient:
             return _client
         c = McpStdioClient(
             mcp_spawn_command(["npx", "-y", "@tableau/mcp-server@latest"]),
-            _build_mcp_env(),
+            _build_mcp_env(force_datasource_tools=force_datasource_tools),
         )
         await c.start()
         _client = c
@@ -120,8 +121,8 @@ def tool_result_to_text(result: dict[str, Any]) -> str:
     return redact_tableau_secrets(text)
 
 
-async def list_tools() -> list[dict[str, Any]]:
-    client = await get_mcp_client()
+async def list_tools(*, force_datasource_tools: bool = False) -> list[dict[str, Any]]:
+    client = await get_mcp_client(force_datasource_tools=force_datasource_tools)
     return await client.list_tools()
 
 
@@ -132,12 +133,17 @@ def _tool_result_is_auth_error(result: dict[str, Any]) -> bool:
     return "401" in text or ("invalid" in text and "token" in text)
 
 
-async def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+async def call_tool(
+    name: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    force_datasource_tools: bool = False,
+) -> dict[str, Any]:
     global _client, _mcp_env_fp
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            client = await get_mcp_client()
+            client = await get_mcp_client(force_datasource_tools=force_datasource_tools)
             result = await client.call_tool(name, arguments)
             if attempt == 0 and _tool_result_is_auth_error(result):
                 await reset_mcp_client()
