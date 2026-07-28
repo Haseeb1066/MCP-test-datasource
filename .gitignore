@@ -7,3 +7,4 @@ __pycache__
 .python-version
 *.local
 .DS_Store
+benchmark-results/

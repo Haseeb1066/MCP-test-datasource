@@ -14,7 +14,7 @@ from backend.chat_mode import (
     uses_datasource_tools,
 )
 from backend.config import env
-from backend.datasources import SelectedDatasource
+from backend.datasources import SelectedDatasource, fetch_fields_via_mcp_metadata
 from backend.mcp_tableau import call_tool, list_tools, tool_result_to_text
 from backend.prompts import (
     DATASOURCE_ANALYST_SYSTEM,
@@ -102,9 +102,10 @@ def _build_system_prompt(
     selected_datasources: list[SelectedDatasource] | None = None,
     *,
     extension_mode: bool = False,
+    force_datasource_mode: bool = False,
 ) -> str:
     datasource_scope = bool(selected_datasources)
-    use_ds = uses_datasource_tools(has_selected_datasources=datasource_scope)
+    use_ds = force_datasource_mode or uses_datasource_tools(has_selected_datasources=datasource_scope)
     base = DATASOURCE_ANALYST_SYSTEM if use_ds else WORKBOOK_ANALYST_SYSTEM
     mode_label = "datasource" if use_ds else get_tableau_chat_mode()
     parts = [base, f"Active mode: {mode_label}."]
@@ -204,9 +205,36 @@ async def _execute_tool(
             return json.dumps({"error": "identifier is required"})
         try:
             out = fetch_published_datasource_fields(ident)
+            # Metadata GraphQL often 403 — fall back to MCP get-datasource-metadata.
+            if (
+                not out.get("matches")
+                or out.get("graphqlErrors")
+                or (out.get("matches") and all(len(m.get("fields") or []) == 0 for m in out["matches"]))
+            ):
+                # Prefer LUID when identifier looks like UUID; otherwise try MCP with LUID from empty match
+                luid = ident
+                if not (len(ident) == 36 and ident.count("-") == 4):
+                    # name-only: still try MCP only if we already have a LUID elsewhere — skip
+                    pass
+                else:
+                    mcp_out = await fetch_fields_via_mcp_metadata(luid)
+                    if mcp_out.get("matches") and any(
+                        (m.get("fields") or []) for m in mcp_out["matches"]
+                    ):
+                        return redact_tableau_secrets(json.dumps(mcp_out))
             return redact_tableau_secrets(json.dumps(out))
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            msg = str(e)
+            # On Metadata 403/failures, try MCP metadata when identifier is a LUID
+            if len(ident) == 36 and ident.count("-") == 4:
+                try:
+                    mcp_out = await fetch_fields_via_mcp_metadata(ident)
+                    if mcp_out.get("matches"):
+                        mcp_out["graphqlFallbackError"] = msg[:300]
+                        return redact_tableau_secrets(json.dumps(mcp_out))
+                except Exception as e2:
+                    return json.dumps({"error": msg, "mcpFallbackError": str(e2)})
+            return json.dumps({"error": msg})
 
     raw = await call_tool(name, args, force_datasource_tools=force_datasource_tools)
     return tool_result_to_text(raw)
@@ -242,11 +270,12 @@ async def run_agent_turn(
     selected_datasources: list[SelectedDatasource] | None = None,
     *,
     extension_mode: bool = False,
+    force_datasource_mode: bool = False,
 ) -> AgentTurnResult:
     turn_start = time.time()
     open_ai_ms = 0
     tools_ms = 0
-    force_ds = bool(selected_datasources)
+    force_ds = force_datasource_mode or bool(selected_datasources)
 
     t_setup = time.time()
     tools = merge_chat_tools(
@@ -262,6 +291,7 @@ async def run_agent_turn(
                 selected_workbook,
                 selected_datasources,
                 extension_mode=extension_mode,
+                force_datasource_mode=force_ds,
             ),
         },
         *user_messages,

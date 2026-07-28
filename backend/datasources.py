@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -83,7 +84,75 @@ def parse_datasources_from_tool_text(text: str) -> list[DatasourceSummary]:
 
 
 async def list_datasources_via_mcp() -> list[DatasourceSummary]:
-    result = await call_tool("list-datasources", {})
+    result = await call_tool("list-datasources", {}, force_datasource_tools=True)
+    text = tool_result_to_text(result)
+    if result.get("isError"):
+        raise RuntimeError(f"list-datasources failed: {text[:800]}")
+    datasources = parse_datasources_from_tool_text(text)
+    if not datasources and text.strip():
+        raise RuntimeError(f"list-datasources returned no parseable datasources. Preview: {text[:400]}")
+    return datasources
+
+
+def parse_fields_from_mcp_metadata(payload: dict[str, Any], *, datasource_luid: str = "") -> dict[str, Any]:
+    """Normalize get-datasource-metadata JSON into list-published-datasource-fields shape."""
+    fields: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in payload.get("fieldGroups") or []:
+        if not isinstance(group, dict):
+            continue
+        for raw in group.get("fields") or []:
+            if not isinstance(raw, dict):
+                continue
+            name = raw.get("name")
+            if not isinstance(name, str) or not name or name in seen:
+                continue
+            seen.add(name)
+            fields.append(
+                {
+                    "name": name,
+                    "typename": raw.get("columnClass") or "Field",
+                    "dataType": raw.get("dataType"),
+                    "formula": raw.get("formula"),
+                }
+            )
+    fields.sort(key=lambda f: f["name"].casefold())
+    return {
+        "identifier": datasource_luid,
+        "matchedBy": "get-datasource-metadata",
+        "matches": [
+            {
+                "name": "",
+                "luid": datasource_luid,
+                "fields": fields,
+            }
+        ],
+        "source": "mcp-get-datasource-metadata",
+        "fieldCount": len(fields),
+    }
+
+
+async def fetch_fields_via_mcp_metadata(datasource_luid: str) -> dict[str, Any]:
+    """Field listing fallback when Tableau Metadata GraphQL is unavailable (403)."""
+    luid = (datasource_luid or "").strip()
+    if not luid:
+        return {"error": "datasourceLuid is required"}
+    raw = await call_tool(
+        "get-datasource-metadata",
+        {"datasourceLuid": luid},
+        force_datasource_tools=True,
+    )
+    text = tool_result_to_text(raw)
+    if raw.get("isError"):
+        return {"error": text[:800], "identifier": luid, "matchedBy": "get-datasource-metadata"}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {"error": f"Unparseable get-datasource-metadata response: {text[:400]}", "identifier": luid}
+    if not isinstance(payload, dict):
+        return {"error": "Unexpected metadata payload type", "identifier": luid}
+    return parse_fields_from_mcp_metadata(payload, datasource_luid=luid)
+
     text = tool_result_to_text(result)
     if result.get("isError"):
         raise RuntimeError(f"list-datasources failed: {text[:800]}")
@@ -146,6 +215,80 @@ async def resolve_datasources_via_mcp(
         return []
     all_ds = await list_datasources_via_mcp()
     return resolve_datasources_from_list(all_ds, names=names, ids=ids)
+
+
+async def resolve_workbook_datasources(
+    workbook_id: str,
+    workbook_name: str | None = None,
+    content_url: str | None = None,
+) -> list[DatasourceSummary]:
+    """Resolve published datasources for a workbook: Metadata API, then MCP name match."""
+    wid = (workbook_id or "").strip()
+    matched: list[DatasourceSummary] = []
+
+    if wid:
+        meta = fetch_workbook_published_datasources(wid)
+        published = [d for d in meta if d.id]
+        if published:
+            return published
+        matched = meta
+
+    try:
+        all_ds = await list_datasources_via_mcp()
+    except RuntimeError:
+        all_ds = []
+
+    if not all_ds:
+        return [d for d in matched if d.id] or matched
+
+    # Match metadata embedded names to published LUIDs
+    if matched:
+        names = [d.name for d in matched if d.name]
+        resolved = resolve_datasources_from_list(all_ds, names=names)
+        if resolved:
+            return resolved
+
+    tokens: set[str] = set()
+    for raw in (workbook_name, content_url):
+        if not raw:
+            continue
+        norm = _normalize_label(raw)
+        if norm:
+            tokens.add(norm)
+        # Accounts Payable (AI-MCP) -> accountspayable
+        base = _normalize_label(raw.split("(")[0])
+        if base:
+            tokens.add(base)
+        # AccountsPayableAI-MCP -> accountspayableaimcp, ap from AP prefix patterns
+        for part in re.split(r"[^a-z0-9]+", raw.lower()):
+            if len(part) >= 2:
+                tokens.add(part)
+        if "payable" in norm or "accountspayable" in norm:
+            tokens.add("ap")
+
+    hits: list[tuple[int, DatasourceSummary]] = []
+    for d in all_ds:
+        dn = _normalize_label(d.name)
+        score = 0
+        for token in tokens:
+            if len(token) < 2:
+                continue
+            if dn == token:
+                score += 100
+            elif dn.startswith(token) or token.startswith(dn):
+                score += 40
+            elif token in dn:
+                score += 20
+        if score > 0:
+            hits.append((score, d))
+
+    if hits:
+        hits.sort(key=lambda x: (-x[0], x[1].name.casefold()))
+        top_score = hits[0][0]
+        # Keep only strong matches (within 15 points of best) to avoid weak token hits.
+        return [d for s, d in hits if s >= max(top_score - 15, 20)]
+
+    return [d for d in matched if d.id] or matched
 
 
 _WORKBOOK_DS_QUERY = """

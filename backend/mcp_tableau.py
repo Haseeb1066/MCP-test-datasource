@@ -5,7 +5,11 @@ import json
 import os
 from typing import Any
 
-from backend.chat_mode import WORKBOOK_MODE_EXCLUDE_GROUPS, is_workbook_mode
+from backend.chat_mode import (
+    DATASOURCE_MODE_EXCLUDE_TOOLS,
+    WORKBOOK_MODE_EXCLUDE_GROUPS,
+    is_workbook_mode,
+)
 from backend.config import env, require_env
 from backend.mcp_stdio import McpStdioClient
 from backend.platform_fix import mcp_spawn_command
@@ -29,14 +33,30 @@ def _build_mcp_env(*, force_datasource_tools: bool = False) -> dict[str, str]:
         mcp_env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
 
     include_tools = env("INCLUDE_TOOLS")
-    enable_metadata = env("ENABLE_DATASOURCE_METADATA_TOOL") == "1"
+    # Prefer MCP get-datasource-metadata in datasource mode (Metadata GraphQL often 403 on Server).
+    disable_mcp_metadata = env("DISABLE_DATASOURCE_METADATA_TOOL") == "1"
+    enable_metadata = env("ENABLE_DATASOURCE_METADATA_TOOL") == "1" or (
+        force_datasource_tools and not disable_mcp_metadata
+    )
     workbook_only = is_workbook_mode() and not force_datasource_tools
+    datasource_only = force_datasource_tools and not include_tools
 
     if workbook_only and not include_tools:
         parts = [p.strip() for p in env("EXCLUDE_TOOLS").split(",") if p.strip()]
         for g in WORKBOOK_MODE_EXCLUDE_GROUPS:
             if g not in parts:
                 parts.append(g)
+        mcp_env["EXCLUDE_TOOLS"] = ",".join(parts)
+    elif datasource_only:
+        parts = [p.strip() for p in env("EXCLUDE_TOOLS").split(",") if p.strip()]
+        for tool in DATASOURCE_MODE_EXCLUDE_TOOLS:
+            if tool not in parts:
+                parts.append(tool)
+        # Keep get-datasource-metadata available unless explicitly disabled.
+        if disable_mcp_metadata:
+            meta = "get-datasource-metadata"
+            if meta not in parts:
+                parts.append(meta)
         mcp_env["EXCLUDE_TOOLS"] = ",".join(parts)
     elif not enable_metadata and not include_tools:
         meta = "get-datasource-metadata"

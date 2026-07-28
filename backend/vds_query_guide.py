@@ -1,36 +1,45 @@
 VDS_QUERY_GUIDE = """
-query-datasource requires datasourceLuid (UUID from list-datasources) and a query object with fields[] and optional filters[].
+query-datasource requires datasourceLuid (UUID from list-datasources) and a query object with fields[].
 
 Rules:
-- Use exact fieldCaption strings from list-published-datasource-fields (case-sensitive).
+- Use exact fieldCaption strings from get-datasource-metadata or list-published-datasource-fields (case-sensitive).
+- Prefer get-datasource-metadata first (works when Metadata GraphQL is forbidden).
+- Do NOT put "limit" inside query (rejected by this MCP schema). Keep queries small with few fields.
 - Every filter needs filterType and field.fieldCaption.
-- For "last year" when the current year is Y: prefer QUANTITATIVE_DATE on the date field with minDate Y-1-01-01 and maxDate Y-1-12-31 (not filterType YEAR alone).
-- Start with limit 100 and 1–3 measures; add dimensions only after a simple query succeeds.
-- If query-datasource errors, read the error text for required fields, fix filterType, and retry. Always call list-published-datasource-fields first if you have not yet.
+- Numeric thresholds (e.g. Outstanding Amount > 10000): use filterType QUANTITATIVE_NUMERICAL with
+  quantitativeFilterType "MIN" and min: 10000 (includeNulls optional). Prefer MIN over RANGE for "greater than".
+- For "last year" when the current year is Y: prefer QUANTITATIVE_DATE on the date field with minDate Y-1-01-01 and maxDate Y-1-12-31.
+- Start with 1–3 fields; add dimensions only after a simple query succeeds.
+- If query-datasource errors, read the error text, fix filterType/captions, and retry.
 
-Example — total for calendar last year (replace field captions after listing fields):
+Example — invoices with Outstanding Amount >= 10000:
 {
-  "fields": [
-    { "fieldCaption": "Performance", "function": "SUM", "fieldAlias": "Total" }
-  ],
-  "filters": [
-    {
-      "field": { "fieldCaption": "Report Date" },
-      "filterType": "QUANTITATIVE_DATE",
-      "quantitativeFilterType": "RANGE",
-      "minDate": "2025-01-01",
-      "maxDate": "2025-12-31"
-    }
-  ]
+  "datasourceLuid": "<uuid>",
+  "query": {
+    "fields": [
+      { "fieldCaption": "Invoice #" },
+      { "fieldCaption": "Creditor" },
+      { "fieldCaption": "Outstanding Amount" }
+    ],
+    "filters": [
+      {
+        "field": { "fieldCaption": "Outstanding Amount" },
+        "filterType": "QUANTITATIVE_NUMERICAL",
+        "quantitativeFilterType": "MIN",
+        "min": 10000,
+        "includeNulls": false
+      }
+    ]
+  }
 }
 
-Relative "last year" alternative (anchor = Jan 1 of current year):
+Example — SUM measure without filter:
 {
-  "field": { "fieldCaption": "Report Date" },
-  "filterType": "DATE",
-  "periodType": "YEARS",
-  "dateRangeType": "LAST",
-  "rangeN": 1,
-  "anchorDate": "2026-01-01"
+  "datasourceLuid": "<uuid>",
+  "query": {
+    "fields": [
+      { "fieldCaption": "Outstanding Amount", "function": "SUM", "fieldAlias": "Total Outstanding" }
+    ]
+  }
 }
 """.strip()

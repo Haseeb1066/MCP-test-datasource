@@ -23,6 +23,7 @@ from backend.datasources import (
     DatasourceSummary,
     fetch_workbook_published_datasources,
     resolve_datasources_via_mcp,
+    resolve_workbook_datasources,
 )
 from backend.runner import run_exclusive
 from backend.tableau_fields import (
@@ -218,30 +219,12 @@ async def api_resolve_datasources(
                 matched = await resolve_datasources_via_mcp(names=name_list)
 
             if wid and not matched:
-                meta = fetch_workbook_published_datasources(wid)
-                published = [d for d in meta if d.id]
-                if published:
-                    matched = published
-                elif name_list:
-                    # keep empty — names didn't resolve
-                    matched = []
-                else:
-                    matched = meta
-
-            # Enrich name-only rows via MCP if we got names from metadata without LUID
-            if wid and matched and any(not d.id for d in matched):
-                names_missing = [d.name for d in matched if not d.id]
-                if names_missing:
-                    resolved = await resolve_datasources_via_mcp(names=names_missing)
-                    by_name = {d.name.casefold(): d for d in resolved}
-                    enriched: list[DatasourceSummary] = []
-                    for d in matched:
-                        if d.id:
-                            enriched.append(d)
-                        else:
-                            hit = by_name.get(d.name.casefold())
-                            enriched.append(hit or d)
-                    matched = enriched
+                wb = await resolve_workbook_via_mcp(workbook_id=wid)
+                matched = await resolve_workbook_datasources(
+                    wid,
+                    wb.name if wb else None,
+                    wb.content_url if wb else None,
+                )
 
             return [d.to_api_dict() for d in matched]
 
@@ -283,7 +266,7 @@ def api_metadata_check() -> dict[str, Any]:
 
 
 @app.get("/api/datasource-fields")
-def api_datasource_fields(
+async def api_datasource_fields(
     luid: Optional[str] = Query(None),
     name: Optional[str] = Query(None),
 ) -> dict[str, Any]:
@@ -291,8 +274,38 @@ def api_datasource_fields(
     if not identifier:
         raise HTTPException(status_code=400, detail="Provide query parameter luid= or name=")
     try:
-        return fetch_published_datasource_fields(identifier)
+        out = fetch_published_datasource_fields(identifier)
+        has_fields = bool(out.get("matches")) and any(
+            (m.get("fields") or []) for m in out.get("matches") or []
+        )
+        if not has_fields and luid and len(luid.strip()) == 36:
+            from backend.datasources import fetch_fields_via_mcp_metadata
+
+            async def _run():
+                await get_mcp_client(force_datasource_tools=True)
+                return await fetch_fields_via_mcp_metadata(luid.strip())
+
+            mcp_out = await run_exclusive(_run)
+            if mcp_out.get("matches"):
+                mcp_out["graphqlFallback"] = out.get("hint") or out.get("error") or "Metadata GraphQL unavailable"
+                return mcp_out
+        return out
     except Exception as e:
+        # LUID path: try MCP metadata on GraphQL 403
+        if luid and len(luid.strip()) == 36:
+            try:
+                from backend.datasources import fetch_fields_via_mcp_metadata
+
+                async def _run():
+                    await get_mcp_client(force_datasource_tools=True)
+                    return await fetch_fields_via_mcp_metadata(luid.strip())
+
+                mcp_out = await run_exclusive(_run)
+                if mcp_out.get("matches"):
+                    mcp_out["graphqlFallbackError"] = str(e)[:300]
+                    return mcp_out
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -322,7 +335,8 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
 
     async def _run():
         scoped = list(datasources)
-        # Extension: if client sent names without LUIDs, resolve against published datasources.
+        use_datasource_mode = extension_mode or bool(scoped)
+
         if scoped and any(not d.id for d in scoped):
             await get_mcp_client(force_datasource_tools=True)
             names = [d.name for d in scoped]
@@ -330,14 +344,30 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
             if resolved:
                 scoped = resolved
             elif workbook and workbook.id:
-                meta = fetch_workbook_published_datasources(workbook.id)
-                if meta:
-                    scoped = [d for d in meta if d.id] or meta
-        elif extension_mode and not scoped and workbook and workbook.id:
+                scoped = await resolve_workbook_datasources(
+                    workbook.id, workbook.name, workbook.content_url
+                )
+        elif extension_mode and workbook and workbook.id:
             await get_mcp_client(force_datasource_tools=True)
-            meta = fetch_workbook_published_datasources(workbook.id)
-            if meta:
-                scoped = [d for d in meta if d.id] or meta
+            resolved = await resolve_workbook_datasources(
+                workbook.id, workbook.name, workbook.content_url
+            )
+            if resolved:
+                scoped = resolved
+
+        # Extension / scoped datasource runs must not fall back to workbook view tools.
+        force_ds = use_datasource_mode or bool(scoped)
+        published = [d for d in scoped if d.id]
+        if force_ds and not published:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "No published datasource LUID resolved for this dashboard. "
+                    "Enable API Access on the published datasource, confirm TABLEAU_SITE_NAME, "
+                    "then retry GET /api/datasources/resolve?workbookId=..."
+                ),
+            )
+        scoped = published or scoped
 
         return await run_agent_turn(
             openai_client,
@@ -345,6 +375,7 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
             workbook,
             scoped or None,
             extension_mode=extension_mode,
+            force_datasource_mode=force_ds,
         )
 
     try:

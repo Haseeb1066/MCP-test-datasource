@@ -7,7 +7,7 @@
     <author name="Nunomics" email="" website="https://nunomics.ai"/>
     <min-api-version>1.0</min-api-version>
     <source-location>
-      <url>https://mcp-test-ldxl.onrender.com</url>
+      <url>https://mcp-test-datasource.onrender.com</url>
     </source-location>
     <icon>iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAMAAAAoLQ9TAAAAllBMVEUAAAD///8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD///8AAAAAbycMPAAAADTRSTlMACq70fENr/vVB3zKk1UAAAApSURBVBjTY2AIYGBgYAAAAAwAAVZsG7IAAAAASUVORK5CYII=</icon>
   </dashboard-extension>
