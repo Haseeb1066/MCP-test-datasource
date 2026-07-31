@@ -1,4 +1,4 @@
-"""Field listing via Tableau Metadata GraphQL (same PAT as MCP)."""
+"""Field listing via Tableau Metadata GraphQL (same auth as MCP: Connected App or PAT)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,10 @@ from typing import Any, Literal, TypedDict
 import httpx
 
 from backend.config import env, httpx_verify, require_env
+from backend.tableau_auth import auth_mode, probe_tableau_sign_in, sign_in
+
+# Re-export for callers / health
+__all__ = ["probe_tableau_sign_in", "sign_in_pat", "fetch_published_datasource_fields", "check_metadata_api_access"]
 
 DEFAULT_REST_VERSION = "3.27"
 LUID_RE = re.compile(
@@ -17,9 +21,8 @@ LUID_RE = re.compile(
 TROUBLESHOOTING = [
     "API Access on a datasource (green checkmarks in Tableau Web) = query-datasource / VizQL. It does NOT grant Metadata API field listing.",
     "Tableau Server: enable Metadata API — tsm maintenance metadata-services enable (requires server admin; services restart).",
-    "Create the PAT while signed in as the same user who has permissions on that datasource (e.g. MPPLAdmin).",
-    "Permissions are per datasource: Administer on NOC Performance does not apply to Budget_vs_Revenue unless that user has access there too.",
-    "PAT user must have View or Administer on each published datasource you query.",
+    "With Connected App: chat runs as the Tableau username you enter (JWT sub). Permissions follow that user.",
+    "Permissions are per datasource: access on one datasource does not apply to another.",
     "Test: GET /api/metadata-check and /api/datasource-fields?name=YourDatasource",
     "If Metadata API stays forbidden, use query-datasource with the LUID from list-datasources anyway.",
 ]
@@ -50,55 +53,8 @@ def _client() -> httpx.Client:
 
 
 def sign_in_pat() -> tuple[str, str]:
-    pat_name = require_env("TABLEAU_PAT_NAME")
-    pat_value = require_env("TABLEAU_PAT_VALUE")
-    url = f"{_server_base()}/api/{_rest_version()}/auth/signin"
-    with _client() as client:
-        res = client.post(
-            url,
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            json={
-                "credentials": {
-                    "site": {"contentUrl": _site_content_url()},
-                    "personalAccessTokenName": pat_name,
-                    "personalAccessTokenSecret": pat_value,
-                }
-            },
-        )
-    raw = res.text
-    if not res.is_success:
-        raise RuntimeError(f"Tableau sign-in failed ({res.status_code}): {raw[:500]}")
-    try:
-        j = res.json()
-        token = j.get("credentials", {}).get("token")
-        site_id = j.get("credentials", {}).get("site", {}).get("id") or ""
-        if not token:
-            raise ValueError("no token")
-        return token, site_id
-    except (ValueError, KeyError, TypeError) as e:
-        if str(e) == "no token":
-            raise RuntimeError(
-                "Tableau sign-in returned no JSON token. Use a server that supports JSON sign-in, or check PAT/site."
-            ) from e
-        raise RuntimeError(
-            f"Tableau sign-in response was not JSON (often XML on older servers). Raw start: {raw[:200]}"
-        ) from e
-
-
-def probe_tableau_sign_in() -> dict[str, Any]:
-    """Lightweight PAT check for /api/health (no Metadata API call)."""
-    try:
-        sign_in_pat()
-        return {"tableauSignInOk": True}
-    except Exception as e:
-        msg = str(e)
-        hint = "Regenerate PAT on Tableau (My Account → Personal Access Tokens) and update TABLEAU_PAT_VALUE in .env."
-        if "401" in msg or "invalid" in msg.lower():
-            hint = (
-                "Tableau rejected the PAT (401). Create a new token on https://nunomics.ai, "
-                "match TABLEAU_PAT_NAME exactly, set TABLEAU_PAT_VALUE with no quotes, restart npm run dev."
-            )
-        return {"tableauSignInOk": False, "tableauSignInError": msg[:300], "tableauHint": hint}
+    """Sign in — Connected App JWT when configured, otherwise PAT."""
+    return sign_in()
 
 
 def _build_query(filter_key: Literal["luid", "name", "nameWithin"], var_type: str) -> str:
@@ -249,12 +205,12 @@ def fetch_published_datasource_fields(identifier: str) -> dict[str, Any]:
 
 
 def check_metadata_api_access() -> dict[str, Any]:
-    pat_name = env("TABLEAU_PAT_NAME")
     site = _site_content_url()
     base: dict[str, Any] = {
         "server": _server_base(),
         "siteContentUrl": site,
-        "patName": pat_name,
+        "authMode": auth_mode(),
+        "patName": env("TABLEAU_PAT_NAME"),
         "signInOk": False,
         "metadataReachable": False,
         "note": (

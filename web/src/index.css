@@ -231,6 +231,54 @@ body {
   background: var(--error);
 }
 
+.user-link-card {
+  margin: 1rem 1.25rem 0;
+  padding: 1.1rem 1.15rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.user-link-card h2 {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.user-link-card p {
+  margin: 0 0 0.85rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.user-link-card code {
+  font-size: 0.8em;
+}
+
+.user-link-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+.user-link-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fff;
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.user-link-row input:focus {
+  outline: none;
+  border-color: rgba(25, 118, 210, 0.55);
+  box-shadow: 0 0 0 3px rgba(25, 118, 210, 0.12);
+}
+
 @keyframes statusPulse {
   0%,
   100% {

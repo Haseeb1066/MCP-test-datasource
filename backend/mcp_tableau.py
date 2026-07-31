@@ -5,6 +5,7 @@ import json
 import os
 from typing import Any
 
+from backend.auth_context import get_tableau_username
 from backend.chat_mode import (
     DATASOURCE_MODE_EXCLUDE_TOOLS,
     WORKBOOK_MODE_EXCLUDE_GROUPS,
@@ -14,23 +15,58 @@ from backend.config import env, require_env
 from backend.mcp_stdio import McpStdioClient
 from backend.platform_fix import mcp_spawn_command
 from backend.redact import redact_tableau_secrets
+from backend.tableau_auth import connected_app_configured, resolve_jwt_username
 
 _client: McpStdioClient | None = None
 _mcp_env_fp: tuple[str, ...] | None = None
 _init_lock = asyncio.Lock()
 
-_MCP_TABLEAU_KEYS = ("SERVER", "SITE_NAME", "PAT_NAME", "PAT_VALUE", "EXCLUDE_TOOLS", "INCLUDE_TOOLS")
+_MCP_FINGERPRINT_KEYS = (
+    "AUTH",
+    "SERVER",
+    "SITE_NAME",
+    "PAT_NAME",
+    "PAT_VALUE",
+    "JWT_SUB_CLAIM",
+    "CONNECTED_APP_CLIENT_ID",
+    "CONNECTED_APP_SECRET_ID",
+    "CONNECTED_APP_SECRET_VALUE",
+    "EXCLUDE_TOOLS",
+    "INCLUDE_TOOLS",
+)
 
 
-def _build_mcp_env(*, force_datasource_tools: bool = False) -> dict[str, str]:
+def _build_mcp_env(
+    *,
+    force_datasource_tools: bool = False,
+    tableau_username: str | None = None,
+) -> dict[str, str]:
     mcp_env = {k: v for k, v in os.environ.items() if isinstance(v, str)}
     mcp_env["SERVER"] = require_env("TABLEAU_SERVER")
     # Tableau MCP reads SITE_NAME; empty string = default site.
     mcp_env["SITE_NAME"] = env("TABLEAU_SITE_NAME")
-    mcp_env["PAT_NAME"] = require_env("TABLEAU_PAT_NAME")
-    mcp_env["PAT_VALUE"] = require_env("TABLEAU_PAT_VALUE")
     if env("NODE_TLS_REJECT_UNAUTHORIZED") == "0":
         mcp_env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+
+    if connected_app_configured():
+        user = resolve_jwt_username(tableau_username)
+        if not user:
+            raise RuntimeError(
+                "Connected App is configured but no Tableau username was provided. "
+                "Enter your Tableau username in the extension, or set TABLEAU_JWT_SUB_CLAIM."
+            )
+        mcp_env["AUTH"] = "direct-trust"
+        mcp_env["JWT_SUB_CLAIM"] = user
+        mcp_env["CONNECTED_APP_CLIENT_ID"] = require_env("TABLEAU_CONNECTED_APP_CLIENT_ID")
+        mcp_env["CONNECTED_APP_SECRET_ID"] = require_env("TABLEAU_CONNECTED_APP_SECRET_ID")
+        mcp_env["CONNECTED_APP_SECRET_VALUE"] = require_env("TABLEAU_CONNECTED_APP_SECRET")
+        # Avoid PAT taking precedence if both are set in the process env.
+        mcp_env.pop("PAT_NAME", None)
+        mcp_env.pop("PAT_VALUE", None)
+    else:
+        mcp_env["AUTH"] = "pat"
+        mcp_env["PAT_NAME"] = require_env("TABLEAU_PAT_NAME")
+        mcp_env["PAT_VALUE"] = require_env("TABLEAU_PAT_VALUE")
 
     include_tools = env("INCLUDE_TOOLS")
     # Prefer MCP get-datasource-metadata in datasource mode (Metadata GraphQL often 403 on Server).
@@ -71,14 +107,30 @@ def _build_mcp_env(*, force_datasource_tools: bool = False) -> dict[str, str]:
     return mcp_env
 
 
-def _mcp_env_fingerprint(*, force_datasource_tools: bool = False) -> tuple[str, ...]:
-    e = _build_mcp_env(force_datasource_tools=force_datasource_tools)
-    return tuple(e.get(k, "") for k in _MCP_TABLEAU_KEYS)
+def _mcp_env_fingerprint(
+    *,
+    force_datasource_tools: bool = False,
+    tableau_username: str | None = None,
+) -> tuple[str, ...]:
+    e = _build_mcp_env(
+        force_datasource_tools=force_datasource_tools,
+        tableau_username=tableau_username,
+    )
+    return tuple(e.get(k, "") for k in _MCP_FINGERPRINT_KEYS)
 
 
 def mcp_tableau_env_summary() -> dict[str, str]:
-    e = _build_mcp_env()
-    return {k: e.get(k, "") for k in ("SERVER", "SITE_NAME", "PAT_NAME", "PAT_VALUE")}
+    try:
+        e = _build_mcp_env(tableau_username=get_tableau_username())
+    except Exception:
+        return {
+            "AUTH": "direct-trust" if connected_app_configured() else "pat",
+            "SITE_NAME": env("TABLEAU_SITE_NAME"),
+        }
+    out = {k: e.get(k, "") for k in ("AUTH", "SERVER", "SITE_NAME", "JWT_SUB_CLAIM", "PAT_NAME")}
+    if out.get("PAT_NAME"):
+        out["PAT_NAME"] = out["PAT_NAME"]  # name only, never value
+    return out
 
 
 async def reset_mcp_client() -> None:
@@ -90,9 +142,17 @@ async def reset_mcp_client() -> None:
         _mcp_env_fp = None
 
 
-async def get_mcp_client(*, force_datasource_tools: bool = False) -> McpStdioClient:
+async def get_mcp_client(
+    *,
+    force_datasource_tools: bool = False,
+    tableau_username: str | None = None,
+) -> McpStdioClient:
     global _client, _mcp_env_fp
-    fp = _mcp_env_fingerprint(force_datasource_tools=force_datasource_tools)
+    user = tableau_username if tableau_username is not None else get_tableau_username()
+    fp = _mcp_env_fingerprint(
+        force_datasource_tools=force_datasource_tools,
+        tableau_username=user,
+    )
     async with _init_lock:
         if _client is not None and _mcp_env_fp != fp:
             await _client.close()
@@ -101,7 +161,10 @@ async def get_mcp_client(*, force_datasource_tools: bool = False) -> McpStdioCli
             return _client
         c = McpStdioClient(
             mcp_spawn_command(["npx", "-y", "@tableau/mcp-server@latest"]),
-            _build_mcp_env(force_datasource_tools=force_datasource_tools),
+            _build_mcp_env(
+                force_datasource_tools=force_datasource_tools,
+                tableau_username=user,
+            ),
         )
         await c.start()
         _client = c

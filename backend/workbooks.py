@@ -75,6 +75,8 @@ def _rows_from_payload(payload: Any) -> list[Any]:
     if isinstance(payload, dict):
         if isinstance(payload.get("workbooks"), list):
             return payload["workbooks"]
+        if isinstance(payload.get("data"), list):
+            return payload["data"]
         if isinstance(payload.get("items"), list):
             return payload["items"]
         if isinstance(payload.get("workbook"), dict):
@@ -191,7 +193,7 @@ async def resolve_workbook_via_mcp(
     name: str | None = None,
     content_url: str | None = None,
     project_name: str | None = None,
-    limit: int = 2000,
+    limit: int = 1000,
 ) -> WorkbookSummary | None:
     workbooks = await list_workbooks_via_mcp(limit=limit)
     return resolve_workbook_from_list(
@@ -203,10 +205,12 @@ async def resolve_workbook_via_mcp(
     )
 
 
-async def list_workbooks_via_mcp(_session: McpStdioClient | None = None, limit: int = 2000) -> list[WorkbookSummary]:
+async def list_workbooks_via_mcp(_session: McpStdioClient | None = None, limit: int = 1000) -> list[WorkbookSummary]:
+    # Tableau MCP schema caps `limit` at 1000.
+    safe_limit = max(1, min(int(limit), 1000))
     raw = await call_tool(
         "list-workbooks",
-        {"limit": limit, "pageSize": min(limit, 1000)},
+        {"limit": safe_limit, "pageSize": safe_limit},
     )
     text = tool_result_to_text(raw)
     if raw.get("isError") or '"isError": true' in text[:200].lower():

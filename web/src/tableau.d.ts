@@ -28,12 +28,17 @@ interface TableauSettings {
   saveAsync(): Promise<void>;
 }
 
+interface TableauEnvironment {
+  readonly uniqueUserId?: string;
+}
+
 interface TableauExtensionsApi {
   initializeAsync(): Promise<void>;
   readonly dashboardContent: {
     readonly dashboard: TableauDashboard;
   };
   readonly settings: TableauSettings;
+  readonly environment?: TableauEnvironment;
 }
 
 interface TableauGlobal {

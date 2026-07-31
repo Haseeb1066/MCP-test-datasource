@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
+from backend.auth_context import tableau_user_context
 from backend.chat import run_agent_turn
 from backend.chat_mode import get_tableau_chat_mode
 from backend.config import env
@@ -26,6 +27,7 @@ from backend.datasources import (
     resolve_workbook_datasources,
 )
 from backend.runner import run_exclusive
+from backend.tableau_auth import auth_mode, connected_app_configured, resolve_jwt_username
 from backend.tableau_fields import (
     check_metadata_api_access,
     fetch_published_datasource_fields,
@@ -68,6 +70,24 @@ class ChatRequest(BaseModel):
     selectedWorkbook: Optional[SelectedWorkbookBody] = None
     selectedDatasources: Optional[list[SelectedDatasourceBody]] = None
     extensionMode: Optional[bool] = None
+    tableauUsername: Optional[str] = None
+    uniqueUserId: Optional[str] = None
+
+
+def _require_tableau_user(username: Optional[str]) -> str | None:
+    """When Connected App is on, ensure we have a JWT username."""
+    if not connected_app_configured():
+        return (username or "").strip() or None
+    user = resolve_jwt_username(username)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Connected App auth requires tableauUsername "
+                "(your Tableau login, e.g. demoAdmin or local\\demoAdmin)."
+            ),
+        )
+    return user
 
 
 def _parse_workbook(body: Optional[SelectedWorkbookBody]) -> Optional[SelectedWorkbook]:
@@ -125,24 +145,56 @@ app.add_middleware(
 
 
 @app.get("/api/health")
-def health() -> dict[str, Any]:
-    has_keys = bool(
-        env("OPENAI_API_KEY")
-        and env("TABLEAU_SERVER")
-        and env("TABLEAU_PAT_NAME")
-        and env("TABLEAU_PAT_VALUE")
+def health(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
+    mode = auth_mode()
+    has_openai = bool(env("OPENAI_API_KEY"))
+    has_tableau = bool(env("TABLEAU_SERVER"))
+    has_auth = mode != "none"
+    with tableau_user_context(tableauUsername):
+        tableau = (
+            probe_tableau_sign_in()
+            if has_tableau and has_auth
+            else {
+                "tableauSignInOk": False,
+                "authMode": mode,
+                "tableauHint": "Set Tableau Connected App or PAT vars in .env",
+            }
+        )
+    # Connected App without a username yet is still "configured" — UI asks for username.
+    ok = has_openai and has_tableau and has_auth and (
+        tableau.get("tableauSignInOk") is True
+        or (
+            mode == "direct-trust"
+            and tableau.get("requiresTableauUsername") is True
+            and not resolve_jwt_username(tableauUsername)
+        )
     )
-    tableau = probe_tableau_sign_in() if has_keys else {"tableauSignInOk": False, "tableauHint": "Set Tableau vars in .env"}
-    ok = has_keys and bool(env("OPENAI_API_KEY")) and tableau.get("tableauSignInOk") is True
-    mcp_env = mcp_tableau_env_summary() if has_keys else {}
+    # Tighten: health.ok true when CA configured even before username (extension can proceed to link form)
+    if mode == "direct-trust" and has_openai and has_tableau:
+        ok = True
+    elif mode == "pat":
+        ok = has_openai and has_tableau and tableau.get("tableauSignInOk") is True
+
+    mcp_env = {}
+    try:
+        with tableau_user_context(tableauUsername or env("TABLEAU_JWT_SUB_CLAIM")):
+            if has_auth and (mode == "pat" or resolve_jwt_username(tableauUsername)):
+                mcp_env = mcp_tableau_env_summary()
+    except Exception:
+        mcp_env = {}
+
     return {
         "ok": ok,
-        "hasOpenAi": bool(env("OPENAI_API_KEY")),
-        "hasTableau": bool(env("TABLEAU_SERVER")),
+        "hasOpenAi": has_openai,
+        "hasTableau": has_tableau,
+        "authMode": mode,
+        "requiresTableauUsername": mode == "direct-trust",
         "chatMode": get_tableau_chat_mode(),
         "backend": "python",
-        "mcpSiteName": mcp_env.get("SITE_NAME", ""),
+        "mcpSiteName": mcp_env.get("SITE_NAME", env("TABLEAU_SITE_NAME")),
         "mcpPatName": mcp_env.get("PAT_NAME", ""),
+        "mcpAuth": mcp_env.get("AUTH", mode),
+        "mcpJwtSub": mcp_env.get("JWT_SUB_CLAIM", ""),
         **tableau,
     }
 
@@ -153,6 +205,7 @@ async def api_resolve_workbook(
     name: Optional[str] = Query(None),
     contentUrl: Optional[str] = Query(None),
     projectName: Optional[str] = Query(None),
+    tableauUsername: Optional[str] = Query(None),
 ) -> dict[str, Any]:
     """Resolve workbook LUID by id, name, project, or contentUrl (for Tableau dashboard extensions)."""
     if not any(
@@ -167,17 +220,20 @@ async def api_resolve_workbook(
             detail="Provide query parameter workbookId=, name=, or contentUrl=",
         )
 
+    user = _require_tableau_user(tableauUsername)
+
     try:
 
         async def _run() -> dict[str, Any] | None:
-            await get_mcp_client()
-            wb = await resolve_workbook_via_mcp(
-                workbook_id=id,
-                name=name,
-                content_url=contentUrl,
-                project_name=projectName,
-            )
-            return wb.to_api_dict() if wb else None
+            with tableau_user_context(user):
+                await get_mcp_client()
+                wb = await resolve_workbook_via_mcp(
+                    workbook_id=id,
+                    name=name,
+                    content_url=contentUrl,
+                    project_name=projectName,
+                )
+                return wb.to_api_dict() if wb else None
 
         workbook = await run_exclusive(_run)
         if not workbook:
@@ -199,6 +255,7 @@ async def api_resolve_workbook(
 async def api_resolve_datasources(
     names: Optional[str] = Query(None, description="Comma-separated datasource names"),
     workbookId: Optional[str] = Query(None),
+    tableauUsername: Optional[str] = Query(None),
 ) -> dict[str, Any]:
     """Resolve published datasource LUIDs by name and/or workbook Metadata upstreams."""
     name_list = [n.strip() for n in (names or "").split(",") if n.strip()]
@@ -209,24 +266,27 @@ async def api_resolve_datasources(
             detail="Provide query parameter names= and/or workbookId=",
         )
 
+    user = _require_tableau_user(tableauUsername)
+
     try:
 
         async def _run() -> list[dict[str, Any]]:
-            await get_mcp_client(force_datasource_tools=True)
-            matched: list[DatasourceSummary] = []
+            with tableau_user_context(user):
+                await get_mcp_client(force_datasource_tools=True)
+                matched: list[DatasourceSummary] = []
 
-            if name_list:
-                matched = await resolve_datasources_via_mcp(names=name_list)
+                if name_list:
+                    matched = await resolve_datasources_via_mcp(names=name_list)
 
-            if wid and not matched:
-                wb = await resolve_workbook_via_mcp(workbook_id=wid)
-                matched = await resolve_workbook_datasources(
-                    wid,
-                    wb.name if wb else None,
-                    wb.content_url if wb else None,
-                )
+                if wid and not matched:
+                    wb = await resolve_workbook_via_mcp(workbook_id=wid)
+                    matched = await resolve_workbook_datasources(
+                        wid,
+                        wb.name if wb else None,
+                        wb.content_url if wb else None,
+                    )
 
-            return [d.to_api_dict() for d in matched]
+                return [d.to_api_dict() for d in matched]
 
         datasources = await run_exclusive(_run)
         return {"datasources": datasources}
@@ -237,18 +297,20 @@ async def api_resolve_datasources(
 
 
 @app.get("/api/workbooks")
-async def api_workbooks() -> dict[str, Any]:
+async def api_workbooks(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
     import logging
     import traceback
 
     log = logging.getLogger("uvicorn.error")
+    user = _require_tableau_user(tableauUsername)
 
     try:
 
         async def _run() -> list[dict[str, Any]]:
-            await get_mcp_client()
-            wbs = await list_workbooks_via_mcp()
-            return [w.to_api_dict() for w in wbs]
+            with tableau_user_context(user):
+                await get_mcp_client()
+                wbs = await list_workbooks_via_mcp()
+                return [w.to_api_dict() for w in wbs]
 
         workbooks = await run_exclusive(_run)
         return {"workbooks": workbooks}
@@ -257,10 +319,20 @@ async def api_workbooks() -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/auth/verify")
+def api_auth_verify(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
+    """Verify Connected App / PAT sign-in for a Tableau username."""
+    user = _require_tableau_user(tableauUsername) if connected_app_configured() else None
+    with tableau_user_context(user):
+        return probe_tableau_sign_in()
+
+
 @app.get("/api/metadata-check")
-def api_metadata_check() -> dict[str, Any]:
+def api_metadata_check(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
+    user = _require_tableau_user(tableauUsername) if connected_app_configured() else None
     try:
-        return check_metadata_api_access()
+        with tableau_user_context(user):
+            return check_metadata_api_access()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -269,12 +341,15 @@ def api_metadata_check() -> dict[str, Any]:
 async def api_datasource_fields(
     luid: Optional[str] = Query(None),
     name: Optional[str] = Query(None),
+    tableauUsername: Optional[str] = Query(None),
 ) -> dict[str, Any]:
     identifier = (luid or name or "").strip()
     if not identifier:
         raise HTTPException(status_code=400, detail="Provide query parameter luid= or name=")
+    user = _require_tableau_user(tableauUsername) if connected_app_configured() else None
     try:
-        out = fetch_published_datasource_fields(identifier)
+        with tableau_user_context(user):
+            out = fetch_published_datasource_fields(identifier)
         has_fields = bool(out.get("matches")) and any(
             (m.get("fields") or []) for m in out.get("matches") or []
         )
@@ -282,8 +357,9 @@ async def api_datasource_fields(
             from backend.datasources import fetch_fields_via_mcp_metadata
 
             async def _run():
-                await get_mcp_client(force_datasource_tools=True)
-                return await fetch_fields_via_mcp_metadata(luid.strip())
+                with tableau_user_context(user):
+                    await get_mcp_client(force_datasource_tools=True)
+                    return await fetch_fields_via_mcp_metadata(luid.strip())
 
             mcp_out = await run_exclusive(_run)
             if mcp_out.get("matches"):
@@ -297,8 +373,9 @@ async def api_datasource_fields(
                 from backend.datasources import fetch_fields_via_mcp_metadata
 
                 async def _run():
-                    await get_mcp_client(force_datasource_tools=True)
-                    return await fetch_fields_via_mcp_metadata(luid.strip())
+                    with tableau_user_context(user):
+                        await get_mcp_client(force_datasource_tools=True)
+                        return await fetch_fields_via_mcp_metadata(luid.strip())
 
                 mcp_out = await run_exclusive(_run)
                 if mcp_out.get("matches"):
@@ -321,6 +398,7 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
             detail="OPENAI_API_KEY is not set in the server environment (.env).",
         )
 
+    user = _require_tableau_user(body.tableauUsername)
     workbook = _parse_workbook(body.selectedWorkbook)
     datasources = _parse_datasources(body.selectedDatasources)
     normalized: list[dict[str, str]] = []
@@ -334,49 +412,50 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
     extension_mode = body.extensionMode is True
 
     async def _run():
-        scoped = list(datasources)
-        use_datasource_mode = extension_mode or bool(scoped)
+        with tableau_user_context(user):
+            scoped = list(datasources)
+            use_datasource_mode = extension_mode or bool(scoped)
 
-        if scoped and any(not d.id for d in scoped):
-            await get_mcp_client(force_datasource_tools=True)
-            names = [d.name for d in scoped]
-            resolved = await resolve_datasources_via_mcp(names=names)
-            if resolved:
-                scoped = resolved
-            elif workbook and workbook.id:
-                scoped = await resolve_workbook_datasources(
+            if scoped and any(not d.id for d in scoped):
+                await get_mcp_client(force_datasource_tools=True)
+                names = [d.name for d in scoped]
+                resolved = await resolve_datasources_via_mcp(names=names)
+                if resolved:
+                    scoped = resolved
+                elif workbook and workbook.id:
+                    scoped = await resolve_workbook_datasources(
+                        workbook.id, workbook.name, workbook.content_url
+                    )
+            elif extension_mode and workbook and workbook.id:
+                await get_mcp_client(force_datasource_tools=True)
+                resolved = await resolve_workbook_datasources(
                     workbook.id, workbook.name, workbook.content_url
                 )
-        elif extension_mode and workbook and workbook.id:
-            await get_mcp_client(force_datasource_tools=True)
-            resolved = await resolve_workbook_datasources(
-                workbook.id, workbook.name, workbook.content_url
-            )
-            if resolved:
-                scoped = resolved
+                if resolved:
+                    scoped = resolved
 
-        # Extension / scoped datasource runs must not fall back to workbook view tools.
-        force_ds = use_datasource_mode or bool(scoped)
-        published = [d for d in scoped if d.id]
-        if force_ds and not published:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "No published datasource LUID resolved for this dashboard. "
-                    "Enable API Access on the published datasource, confirm TABLEAU_SITE_NAME, "
-                    "then retry GET /api/datasources/resolve?workbookId=..."
-                ),
-            )
-        scoped = published or scoped
+            # Extension / scoped datasource runs must not fall back to workbook view tools.
+            force_ds = use_datasource_mode or bool(scoped)
+            published = [d for d in scoped if d.id]
+            if force_ds and not published:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "No published datasource LUID resolved for this dashboard. "
+                        "Enable API Access on the published datasource, confirm TABLEAU_SITE_NAME, "
+                        "then retry GET /api/datasources/resolve?workbookId=..."
+                    ),
+                )
+            scoped = published or scoped
 
-        return await run_agent_turn(
-            openai_client,
-            normalized,
-            workbook,
-            scoped or None,
-            extension_mode=extension_mode,
-            force_datasource_mode=force_ds,
-        )
+            return await run_agent_turn(
+                openai_client,
+                normalized,
+                workbook,
+                scoped or None,
+                extension_mode=extension_mode,
+                force_datasource_mode=force_ds,
+            )
 
     try:
         result = await run_exclusive(_run)

@@ -1,5 +1,14 @@
 import { apiUrl, isTableauHost } from "./config";
 import { readJson } from "./api";
+import {
+  getTableauUsername,
+  getUniqueUserId,
+  loadStoredTableauUsername,
+  setTableauUsername,
+  setUniqueUserId,
+  settingsUsernameKey,
+  withTableauUser,
+} from "./tableauUser";
 
 export type WorkbookSummary = {
   id: string;
@@ -60,7 +69,7 @@ async function resolveWorkbook(options: {
   projectName?: string;
   contentUrl?: string;
 }): Promise<WorkbookSummary> {
-  const qs = new URLSearchParams();
+  const qs = withTableauUser(new URLSearchParams());
   if (options.workbookId) qs.set("workbookId", options.workbookId);
   if (options.name) qs.set("name", options.name);
   if (options.projectName) qs.set("projectName", options.projectName);
@@ -77,10 +86,10 @@ async function resolveDatasources(options: {
   names?: string[];
   workbookId?: string;
 }): Promise<DatasourceSummary[]> {
-  const qs = new URLSearchParams();
+  if (!options.names?.length && !options.workbookId) return [];
+  const qs = withTableauUser(new URLSearchParams());
   if (options.names?.length) qs.set("names", options.names.join(","));
   if (options.workbookId) qs.set("workbookId", options.workbookId);
-  if (![...qs.keys()].length) return [];
   try {
     const res = await fetch(apiUrl(`/api/datasources/resolve?${qs}`));
     if (!res.ok) return [];
@@ -365,6 +374,24 @@ async function loadFromTableauApi(
 
   await api.initializeAsync();
   await api.settings.initializeAsync();
+  const uid = api.environment?.uniqueUserId;
+  if (uid) setUniqueUserId(uid);
+  const fromSettings = sanitizeParam(api.settings.get(settingsUsernameKey()) ?? null);
+  const fromQuery = sanitizeParam(
+    new URLSearchParams(window.location.search).get("tableauUsername")
+  );
+  const stored = fromQuery || fromSettings || loadStoredTableauUsername();
+  if (stored) {
+    setTableauUsername(stored);
+    if (fromQuery || !fromSettings) {
+      try {
+        api.settings.set(settingsUsernameKey(), stored);
+        await api.settings.saveAsync();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
   const dashboard = api.dashboardContent.dashboard;
   const settings = api.settings;
   const tableauWorkbookName = dashboard.workbook.name;
@@ -496,8 +523,30 @@ async function loadFromLocalTest(test: ReturnType<typeof testParamsFromQuery>): 
  */
 export async function loadExtensionContext(): Promise<ExtensionContext> {
   const test = testParamsFromQuery();
+  const fromQuery = sanitizeParam(
+    new URLSearchParams(window.location.search).get("tableauUsername")
+  );
+  if (fromQuery) setTableauUsername(fromQuery);
+  else loadStoredTableauUsername();
+
   if (isTableauHost()) {
     return loadFromTableauHost(test);
   }
   return loadFromLocalTest(test);
 }
+
+/** Persist Tableau username in extension settings when available. */
+export async function persistTableauUsername(username: string): Promise<void> {
+  setTableauUsername(username);
+  const api = window.tableau?.extensions;
+  if (!api) return;
+  try {
+    await api.settings.initializeAsync();
+    api.settings.set(settingsUsernameKey(), username.trim());
+    await api.settings.saveAsync();
+  } catch {
+    /* ignore */
+  }
+}
+
+export { getTableauUsername, getUniqueUserId, setTableauUsername, loadStoredTableauUsername };

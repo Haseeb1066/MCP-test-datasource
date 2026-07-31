@@ -2,9 +2,12 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "re
 import { readJson } from "./api";
 import { apiUrl } from "./config";
 import {
+  getTableauUsername,
+  getUniqueUserId,
   loadExtensionContext,
+  loadStoredTableauUsername,
+  persistTableauUsername,
   type ExtensionContext,
-  type WorkbookSummary,
 } from "./tableauExtension";
 import type { ToolStep, TurnTiming } from "./ToolSteps";
 
@@ -16,6 +19,17 @@ interface ChatMessage {
   steps?: ToolStep[];
   timing?: TurnTiming;
 }
+
+type HealthInfo = {
+  ok: boolean;
+  healthError?: string;
+  hasOpenAi?: boolean;
+  chatMode?: "workbook" | "datasource";
+  authMode?: string;
+  requiresTableauUsername?: boolean;
+  tableauSignInOk?: boolean;
+  tableauHint?: string;
+};
 
 function BrandMark() {
   return (
@@ -37,72 +51,98 @@ export function App() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [health, setHealth] = useState<{
-    ok: boolean;
-    healthError?: string;
-    hasOpenAi?: boolean;
-    chatMode?: "workbook" | "datasource";
-    tableauSignInOk?: boolean;
-    tableauHint?: string;
-  } | null>(null);
+  const [health, setHealth] = useState<HealthInfo | null>(null);
   const [extensionContext, setExtensionContext] = useState<ExtensionContext | null>(null);
-  const [workbookLoading, setWorkbookLoading] = useState(true);
+  const [workbookLoading, setWorkbookLoading] = useState(false);
   const [workbookError, setWorkbookError] = useState<string | null>(null);
+  const [tableauUsername, setTableauUsernameState] = useState<string>(
+    () => loadStoredTableauUsername() || ""
+  );
+  const [usernameDraft, setUsernameDraft] = useState(() => loadStoredTableauUsername() || "");
+  const [linkingUser, setLinkingUser] = useState(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const selectedWorkbook = extensionContext?.workbook ?? null;
   const selectedDatasources = extensionContext?.datasources ?? [];
+  const needsUsername = health?.requiresTableauUsername === true;
+  const hasUsername = !!tableauUsername.trim();
 
   useEffect(() => {
-    fetch(apiUrl("/api/health"))
+    const qs = tableauUsername.trim()
+      ? `?tableauUsername=${encodeURIComponent(tableauUsername.trim())}`
+      : "";
+    fetch(apiUrl(`/api/health${qs}`))
       .then(async (r) => {
         try {
-          return await readJson<{
-            ok: boolean;
-            hasOpenAi?: boolean;
-            chatMode?: "workbook" | "datasource";
-            tableauSignInOk?: boolean;
-            tableauHint?: string;
-          }>(r);
+          return await readJson<HealthInfo>(r);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           return { ok: false as const, healthError: message };
         }
       })
       .then(setHealth);
+  }, [tableauUsername]);
+
+  const reloadWorkbook = useCallback(async () => {
+    setWorkbookLoading(true);
+    setWorkbookError(null);
+    try {
+      const ctx = await loadExtensionContext();
+      setExtensionContext(ctx);
+      setWorkbookError(null);
+    } catch (e) {
+      setWorkbookError(e instanceof Error ? e.message : String(e));
+      setExtensionContext(null);
+    } finally {
+      setWorkbookLoading(false);
+    }
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    setWorkbookLoading(true);
-    setWorkbookError(null);
-
-    loadExtensionContext()
-      .then((ctx) => {
-        if (!cancelled) {
-          setExtensionContext(ctx);
-          setWorkbookError(null);
-        }
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setWorkbookError(e instanceof Error ? e.message : String(e));
-          setExtensionContext(null);
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setWorkbookLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (health === null) return;
+    if (needsUsername && !hasUsername) {
+      setWorkbookLoading(false);
+      return;
+    }
+    void reloadWorkbook();
+  }, [health, needsUsername, hasUsername, reloadWorkbook]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+
+  const linkUsername = useCallback(async () => {
+    const cleaned = usernameDraft.trim();
+    if (!cleaned) {
+      setLinkError("Enter your Tableau username (e.g. demoAdmin or local\\demoAdmin).");
+      return;
+    }
+    setLinkingUser(true);
+    setLinkError(null);
+    try {
+      const res = await fetch(
+        apiUrl(`/api/auth/verify?tableauUsername=${encodeURIComponent(cleaned)}`)
+      );
+      const data = await readJson<{
+        tableauSignInOk?: boolean;
+        tableauHint?: string;
+        tableauError?: string;
+      }>(res);
+      if (!data.tableauSignInOk) {
+        throw new Error(
+          data.tableauHint || data.tableauError || "Sign-in failed for that username."
+        );
+      }
+      await persistTableauUsername(cleaned);
+      setTableauUsernameState(cleaned);
+    } catch (e) {
+      setLinkError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLinkingUser(false);
+    }
+  }, [usernameDraft]);
 
   const sendMessage = useCallback(
     async (text: string) => {
@@ -110,6 +150,11 @@ export function App() {
       if (!trimmed || loading) return;
       if (!selectedWorkbook) {
         setError("Connecting…");
+        return;
+      }
+      const user = getTableauUsername() || tableauUsername.trim();
+      if (needsUsername && !user) {
+        setError("Link your Tableau username first.");
         return;
       }
 
@@ -137,6 +182,8 @@ export function App() {
                 }
               : {}),
             extensionMode: true,
+            ...(user ? { tableauUsername: user } : {}),
+            ...(getUniqueUserId() ? { uniqueUserId: getUniqueUserId() } : {}),
           }),
         });
         const data = await readJson<{
@@ -164,7 +211,7 @@ export function App() {
         textareaRef.current?.focus();
       }
     },
-    [loading, messages, selectedWorkbook, selectedDatasources]
+    [loading, messages, selectedWorkbook, selectedDatasources, needsUsername, tableauUsername]
   );
 
   const send = useCallback(() => void sendMessage(input), [input, sendMessage]);
@@ -183,30 +230,38 @@ export function App() {
   };
 
   const workbookReady = !!selectedWorkbook;
-  const canSend = !loading && !!input.trim() && health?.ok && workbookReady && !workbookLoading;
+  const canSend =
+    !loading &&
+    !!input.trim() &&
+    health?.ok &&
+    workbookReady &&
+    !workbookLoading &&
+    (!needsUsername || hasUsername);
 
   const statusMessage = (() => {
     if (health === null) return "Checking connection…";
     if (health.healthError) return health.healthError;
+    if (needsUsername && !hasUsername) return "Enter your Tableau username to continue";
     if (workbookLoading) return "Connecting…";
     if (workbookError) return workbookError;
     if (!health.ok) {
       if (health.tableauSignInOk === false && health.tableauHint) return health.tableauHint;
       if (!health.hasOpenAi) return "Set OPENAI_API_KEY on the server";
-      return "Set Tableau PAT on the server";
+      return "Set Tableau Connected App or PAT on the server";
     }
     if (selectedWorkbook && selectedDatasources.length > 0) {
       const n = selectedDatasources.length;
-      return `Connected · ${n} datasource${n === 1 ? "" : "s"}`;
+      const who = tableauUsername ? ` · ${tableauUsername}` : "";
+      return `Connected · ${n} datasource${n === 1 ? "" : "s"}${who}`;
     }
     if (selectedWorkbook) {
-      return "Connected";
+      return tableauUsername ? `Connected · ${tableauUsername}` : "Connected";
     }
     return "Connected";
   })();
 
   const statusClass =
-    health === null || workbookLoading
+    health === null || workbookLoading || (needsUsername && !hasUsername)
       ? "status-pill--loading"
       : health?.healthError || workbookError || !health?.ok
         ? "status-pill--error"
@@ -238,102 +293,139 @@ export function App() {
           </div>
         </header>
 
-        <main className="messages" role="log" aria-live="polite" aria-relevant="additions">
-          {messages.length === 0 &&
-            !loading &&
-            !selectedWorkbook &&
-            health?.ok &&
-            !workbookLoading && (
-              <div className="empty-state-card">
-                <p>{workbookError ? "Could not connect to this dashboard." : "Connecting…"}</p>
-              </div>
+        {needsUsername && !hasUsername ? (
+          <div className="user-link-card">
+            <h2>Link Tableau user</h2>
+            <p>
+              Chat runs as your Tableau account (Connected App). Enter the same username you use to
+              sign in — for example <code>demoAdmin</code> or <code>local\demoAdmin</code>.
+            </p>
+            <div className="user-link-row">
+              <input
+                type="text"
+                value={usernameDraft}
+                onChange={(e) => setUsernameDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void linkUsername();
+                  }
+                }}
+                placeholder="Tableau username"
+                aria-label="Tableau username"
+                disabled={linkingUser}
+                autoComplete="username"
+              />
+              <button type="button" className="btn-send" onClick={() => void linkUsername()} disabled={linkingUser}>
+                {linkingUser ? "…" : "Continue"}
+              </button>
+            </div>
+            {linkError && (
+              <p className="composer-error" role="alert">
+                {linkError}
+              </p>
+            )}
+          </div>
+        ) : (
+          <>
+            <main className="messages" role="log" aria-live="polite" aria-relevant="additions">
+              {messages.length === 0 &&
+                !loading &&
+                !selectedWorkbook &&
+                health?.ok &&
+                !workbookLoading && (
+                  <div className="empty-state-card">
+                    <p>{workbookError ? "Could not connect to this dashboard." : "Connecting…"}</p>
+                  </div>
+                )}
+
+              {messages.map((m, i) => (
+                <div
+                  key={i}
+                  className={`msg-block msg-block--${m.role}`}
+                  style={{ animationDelay: `${Math.min(i, 8) * 40}ms` }}
+                >
+                  <div className="msg-avatar" aria-hidden="true">
+                    {m.role === "user" ? "You" : "AI"}
+                  </div>
+                  <div className="msg-content">
+                    <div
+                      className={`msg msg--${m.role}${error && i === messages.length - 1 && m.role === "assistant" ? " msg--error" : ""}`}
+                    >
+                      {m.content}
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              {loading && (
+                <div className="msg-block msg-block--assistant">
+                  <div className="msg-avatar" aria-hidden="true">
+                    AI
+                  </div>
+                  <div className="msg msg--assistant msg--loading">
+                    <span className="typing-dots" aria-hidden="true">
+                      <span />
+                      <span />
+                      <span />
+                    </span>
+                    Thinking…
+                  </div>
+                </div>
+              )}
+              <div ref={bottomRef} />
+            </main>
+
+            {error && messages.length === 0 && (
+              <p className="composer-error" role="alert">
+                {error}
+              </p>
             )}
 
-          {messages.map((m, i) => (
-            <div
-              key={i}
-              className={`msg-block msg-block--${m.role}`}
-              style={{ animationDelay: `${Math.min(i, 8) * 40}ms` }}
-            >
-              <div className="msg-avatar" aria-hidden="true">
-                {m.role === "user" ? "You" : "AI"}
-              </div>
-              <div className="msg-content">
-                <div
-                  className={`msg msg--${m.role}${error && i === messages.length - 1 && m.role === "assistant" ? " msg--error" : ""}`}
-                >
-                  {m.content}
-                </div>
-              </div>
-            </div>
-          ))}
-
-          {loading && (
-            <div className="msg-block msg-block--assistant">
-              <div className="msg-avatar" aria-hidden="true">
-                AI
-              </div>
-              <div className="msg msg--assistant msg--loading">
-                <span className="typing-dots" aria-hidden="true">
-                  <span />
-                  <span />
-                  <span />
-                </span>
-                Thinking…
-              </div>
-            </div>
-          )}
-          <div ref={bottomRef} />
-        </main>
-
-        {error && messages.length === 0 && (
-          <p className="composer-error" role="alert">
-            {error}
-          </p>
-        )}
-
-        <footer className="composer">
-          <div className="composer-inner">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={onKeyDown}
-              placeholder={
-                workbookLoading
-                  ? "Connecting…"
-                  : !health?.ok
-                    ? "Connecting…"
-                    : !selectedWorkbook
+            <footer className="composer">
+              <div className="composer-inner">
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={onKeyDown}
+                  placeholder={
+                    workbookLoading
                       ? "Connecting…"
-                      : "Ask a question…"
-              }
-              rows={1}
-              disabled={loading || workbookLoading}
-              aria-label="Message"
-            />
-            <button
-              type="button"
-              className="btn-send"
-              onClick={() => void send()}
-              disabled={!canSend}
-              aria-label="Send message"
-            >
-              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path
-                  d="M5 12h14M13 6l6 6-6 6"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+                      : !health?.ok
+                        ? "Connecting…"
+                        : !selectedWorkbook
+                          ? "Connecting…"
+                          : "Ask a question…"
+                  }
+                  rows={1}
+                  disabled={loading || workbookLoading}
+                  aria-label="Message"
                 />
-              </svg>
-            </button>
-          </div>
-          <p className="composer-hint">
-            <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for new line
-          </p>
-        </footer>
+                <button
+                  type="button"
+                  className="btn-send"
+                  onClick={() => void send()}
+                  disabled={!canSend}
+                  aria-label="Send message"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path
+                      d="M5 12h14M13 6l6 6-6 6"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                </button>
+              </div>
+              <p className="composer-hint">
+                <kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for new line
+              </p>
+            </footer>
+          </>
+        )}
       </div>
     </div>
   );

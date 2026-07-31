@@ -60,7 +60,7 @@ def _rows_from_payload(payload: Any) -> list[Any]:
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        for key in ("datasources", "items", "publishedDatasources"):
+        for key in ("datasources", "data", "items", "publishedDatasources"):
             if isinstance(payload.get(key), list):
                 return payload[key]
         if isinstance(payload.get("datasource"), dict):
@@ -152,14 +152,6 @@ async def fetch_fields_via_mcp_metadata(datasource_luid: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"error": "Unexpected metadata payload type", "identifier": luid}
     return parse_fields_from_mcp_metadata(payload, datasource_luid=luid)
-
-    text = tool_result_to_text(result)
-    if result.get("isError"):
-        raise RuntimeError(f"list-datasources failed: {text[:800]}")
-    datasources = parse_datasources_from_tool_text(text)
-    if not datasources and text.strip():
-        raise RuntimeError(f"list-datasources returned no parseable datasources. Preview: {text[:400]}")
-    return datasources
 
 
 def resolve_datasources_from_list(
