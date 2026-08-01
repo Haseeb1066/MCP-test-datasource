@@ -2,12 +2,12 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "re
 import { readJson } from "./api";
 import { apiUrl } from "./config";
 import {
+  ensureTableauSession,
   getTableauUsername,
   getUniqueUserId,
   loadExtensionContext,
   persistTableauUsername,
   setTableauUsername,
-  setUniqueUserId,
   type ExtensionContext,
 } from "./tableauExtension";
 import type { ToolStep, TurnTiming } from "./ToolSteps";
@@ -48,30 +48,6 @@ function BrandMark() {
   );
 }
 
-async function captureUniqueUserIdFromTableau(): Promise<string | null> {
-  const existing = getUniqueUserId();
-  if (existing) return existing;
-
-  const start = Date.now();
-  while (Date.now() - start < 8_000) {
-    const api = window.tableau?.extensions;
-    if (api) {
-      try {
-        await api.initializeAsync();
-        const uid = api.environment?.uniqueUserId?.trim();
-        if (uid) {
-          setUniqueUserId(uid);
-          return uid;
-        }
-      } catch {
-        /* keep waiting */
-      }
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  return getUniqueUserId();
-}
-
 export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -100,16 +76,18 @@ export function App() {
       setIdentityLoading(true);
       setIdentityError(null);
       try {
-        const uid = await captureUniqueUserIdFromTableau();
+        const session = await ensureTableauSession();
+        if (cancelled) return;
+
+        const uid = session.uniqueUserId;
         if (!uid) {
-          // Local browser test without Tableau: leave unresolved.
-          if (!cancelled) {
-            setIdentityError(
-              "No Tableau uniqueUserId. Open this extension inside a Tableau dashboard while signed in."
-            );
-          }
+          setIdentityError(
+            session.error ||
+              "No Tableau uniqueUserId. Open this extension inside a Tableau dashboard while signed in (Tableau 2023.2+)."
+          );
           return;
         }
+
         const qs = new URLSearchParams({ uniqueUserId: uid });
         const res = await fetch(apiUrl(`/api/auth/resolve?${qs}`));
         const data = await readJson<{
@@ -355,8 +333,8 @@ export function App() {
           <div className="user-link-card">
             <h2>Could not detect Tableau user</h2>
             <p>
-              This extension uses your signed-in Tableau session only. Open it from a dashboard
-              while logged in. Username entry is disabled to prevent impersonation.
+              Open this from a <strong>dashboard extension</strong> while signed into Tableau (not a
+              normal browser tab). Tableau <strong>2023.2+</strong> is required for session user id.
             </p>
             {identityError && (
               <p className="composer-error" role="alert">

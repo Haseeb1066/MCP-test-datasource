@@ -310,6 +310,130 @@ async function waitForTableauApi(timeoutMs = 12_000) {
   return null;
 }
 
+export type TableauSessionInfo = {
+  uniqueUserId: string | null;
+  tableauVersion: string | null;
+  mode: string | null;
+  initialized: boolean;
+  error: string | null;
+};
+
+let _tableauInitPromise: Promise<TableauSessionInfo> | null = null;
+
+/**
+ * Initialize Extensions API once and capture uniqueUserId.
+ * uniqueUserId requires Tableau 2023.2+ and running inside a dashboard extension.
+ */
+export async function ensureTableauSession(timeoutMs = 15_000): Promise<TableauSessionInfo> {
+  if (_tableauInitPromise) return _tableauInitPromise;
+
+  _tableauInitPromise = (async () => {
+    const fromQuery = sanitizeParam(
+      new URLSearchParams(window.location.search).get("uniqueUserId")
+    );
+    if (fromQuery) {
+      setUniqueUserId(fromQuery);
+      return {
+        uniqueUserId: fromQuery,
+        tableauVersion: null,
+        mode: "query",
+        initialized: true,
+        error: null,
+      };
+    }
+
+    const existing = getUniqueUserId();
+    if (existing) {
+      return {
+        uniqueUserId: existing,
+        tableauVersion: null,
+        mode: null,
+        initialized: true,
+        error: null,
+      };
+    }
+
+    const api = await waitForTableauApi(timeoutMs);
+    if (!api) {
+      return {
+        uniqueUserId: null,
+        tableauVersion: null,
+        mode: null,
+        initialized: false,
+        error:
+          "Tableau Extensions API did not load. Open this from a Tableau dashboard extension (not a normal browser tab).",
+      };
+    }
+
+    try {
+      await api.initializeAsync();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const notInTableau =
+        /iframe|desktop|popup|initialization failed/i.test(msg) ||
+        /not running inside/i.test(msg);
+      return {
+        uniqueUserId: null,
+        tableauVersion: null,
+        mode: null,
+        initialized: false,
+        error: notInTableau
+          ? "This page is not running inside Tableau. Add the .trex extension to a dashboard and open it there while signed in."
+          : `Tableau initialize failed: ${msg}`,
+      };
+    }
+
+    try {
+      await api.settings.initializeAsync();
+    } catch {
+      /* settings optional for identity */
+    }
+
+    const env = api.environment;
+    const version = env?.tableauVersion?.trim() || null;
+    const mode = env?.mode?.trim() || null;
+    let uid = env?.uniqueUserId?.trim() || null;
+
+    // Some hosts populate uniqueUserId slightly after init — brief poll.
+    if (!uid) {
+      const start = Date.now();
+      while (Date.now() - start < 2_000) {
+        uid = api.environment?.uniqueUserId?.trim() || null;
+        if (uid) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+
+    if (uid) {
+      setUniqueUserId(uid);
+      return {
+        uniqueUserId: uid,
+        tableauVersion: version,
+        mode,
+        initialized: true,
+        error: null,
+      };
+    }
+
+    return {
+      uniqueUserId: null,
+      tableauVersion: version,
+      mode,
+      initialized: true,
+      error: version
+        ? `Tableau session has no uniqueUserId (version ${version}). uniqueUserId needs Tableau 2023.2+. Upgrade Server/Desktop, or pass ?uniqueUserId=<user-luid> for testing.`
+        : "Tableau initialized but uniqueUserId is missing. Requires Tableau 2023.2+, or open the extension inside a signed-in dashboard (not a browser tab).",
+    };
+  })();
+
+  try {
+    return await _tableauInitPromise;
+  } catch (e) {
+    _tableauInitPromise = null;
+    throw e;
+  }
+}
+
 async function persistWorkbookContext(
   settings: TableauSettings,
   workbook: WorkbookSummary,
@@ -367,14 +491,19 @@ async function loadFromDashboardUrl(
 async function loadFromTableauApi(
   test: ReturnType<typeof testParamsFromQuery>
 ): Promise<ExtensionContext> {
+  const session = await ensureTableauSession();
   const api = await waitForTableauApi();
-  if (!api) {
-    throw new Error("Tableau Extensions API not available");
+  if (!api || !session.initialized) {
+    throw new Error(session.error || "Tableau Extensions API not available");
   }
 
-  await api.initializeAsync();
-  await api.settings.initializeAsync();
-  const uid = api.environment?.uniqueUserId;
+  // initializeAsync already done in ensureTableauSession
+  try {
+    await api.settings.initializeAsync();
+  } catch {
+    /* ignore */
+  }
+  const uid = session.uniqueUserId || api.environment?.uniqueUserId;
   if (uid) setUniqueUserId(uid);
   const fromSettings = sanitizeParam(api.settings.get(settingsUsernameKey()) ?? null);
   const fromQuery = sanitizeParam(

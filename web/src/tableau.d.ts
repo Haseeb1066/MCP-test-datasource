@@ -30,6 +30,9 @@ interface TableauSettings {
 
 interface TableauEnvironment {
   readonly uniqueUserId?: string;
+  readonly tableauVersion?: string;
+  readonly apiVersion?: string;
+  readonly mode?: string;
 }
 
 interface TableauExtensionsApi {
