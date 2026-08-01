@@ -5,8 +5,9 @@ import {
   getTableauUsername,
   getUniqueUserId,
   loadExtensionContext,
-  loadStoredTableauUsername,
   persistTableauUsername,
+  setTableauUsername,
+  setUniqueUserId,
   type ExtensionContext,
 } from "./tableauExtension";
 import type { ToolStep, TurnTiming } from "./ToolSteps";
@@ -26,7 +27,8 @@ type HealthInfo = {
   hasOpenAi?: boolean;
   chatMode?: "workbook" | "datasource";
   authMode?: string;
-  requiresTableauUsername?: boolean;
+  requiresUniqueUserId?: boolean;
+  resolvedUsername?: string;
   tableauSignInOk?: boolean;
   tableauHint?: string;
 };
@@ -46,6 +48,30 @@ function BrandMark() {
   );
 }
 
+async function captureUniqueUserIdFromTableau(): Promise<string | null> {
+  const existing = getUniqueUserId();
+  if (existing) return existing;
+
+  const start = Date.now();
+  while (Date.now() - start < 8_000) {
+    const api = window.tableau?.extensions;
+    if (api) {
+      try {
+        await api.initializeAsync();
+        const uid = api.environment?.uniqueUserId?.trim();
+        if (uid) {
+          setUniqueUserId(uid);
+          return uid;
+        }
+      } catch {
+        /* keep waiting */
+      }
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return getUniqueUserId();
+}
+
 export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -55,25 +81,81 @@ export function App() {
   const [extensionContext, setExtensionContext] = useState<ExtensionContext | null>(null);
   const [workbookLoading, setWorkbookLoading] = useState(false);
   const [workbookError, setWorkbookError] = useState<string | null>(null);
-  const [tableauUsername, setTableauUsernameState] = useState<string>(
-    () => loadStoredTableauUsername() || ""
-  );
-  const [usernameDraft, setUsernameDraft] = useState(() => loadStoredTableauUsername() || "");
-  const [linkingUser, setLinkingUser] = useState(false);
-  const [linkError, setLinkError] = useState<string | null>(null);
+  const [tableauUsername, setTableauUsernameState] = useState("");
+  const [identityLoading, setIdentityLoading] = useState(true);
+  const [identityError, setIdentityError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const selectedWorkbook = extensionContext?.workbook ?? null;
   const selectedDatasources = extensionContext?.datasources ?? [];
-  const needsUsername = health?.requiresTableauUsername === true;
   const hasUsername = !!tableauUsername.trim();
+  const identityFailed =
+    !identityLoading && health?.authMode === "direct-trust" && !hasUsername;
+
+  // Resolve identity from Tableau uniqueUserId only (no username prompt).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setIdentityLoading(true);
+      setIdentityError(null);
+      try {
+        const uid = await captureUniqueUserIdFromTableau();
+        if (!uid) {
+          // Local browser test without Tableau: leave unresolved.
+          if (!cancelled) {
+            setIdentityError(
+              "No Tableau uniqueUserId. Open this extension inside a Tableau dashboard while signed in."
+            );
+          }
+          return;
+        }
+        const qs = new URLSearchParams({ uniqueUserId: uid });
+        const res = await fetch(apiUrl(`/api/auth/resolve?${qs}`));
+        const data = await readJson<{
+          resolved?: boolean;
+          tableauUsername?: string | null;
+          tableauSignInOk?: boolean;
+          hint?: string;
+          tableauHint?: string;
+          tableauError?: string;
+        }>(res);
+
+        if (cancelled) return;
+
+        if (data.resolved && data.tableauUsername && data.tableauSignInOk !== false) {
+          setTableauUsername(data.tableauUsername);
+          setTableauUsernameState(data.tableauUsername);
+          await persistTableauUsername(data.tableauUsername);
+          setIdentityError(null);
+        } else {
+          setIdentityError(
+            data.tableauHint ||
+              data.hint ||
+              data.tableauError ||
+              "Could not map your Tableau session to a site user."
+          );
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setIdentityError(e instanceof Error ? e.message : String(e));
+        }
+      } finally {
+        if (!cancelled) setIdentityLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
-    const qs = tableauUsername.trim()
-      ? `?tableauUsername=${encodeURIComponent(tableauUsername.trim())}`
-      : "";
-    fetch(apiUrl(`/api/health${qs}`))
+    if (identityLoading) return;
+    const qs = new URLSearchParams();
+    const uid = getUniqueUserId();
+    if (uid) qs.set("uniqueUserId", uid);
+    const q = qs.toString() ? `?${qs}` : "";
+    fetch(apiUrl(`/api/health${q}`))
       .then(async (r) => {
         try {
           return await readJson<HealthInfo>(r);
@@ -82,8 +164,14 @@ export function App() {
           return { ok: false as const, healthError: message };
         }
       })
-      .then(setHealth);
-  }, [tableauUsername]);
+      .then((h) => {
+        setHealth(h);
+        if (h.resolvedUsername && !getTableauUsername()) {
+          setTableauUsername(h.resolvedUsername);
+          setTableauUsernameState(h.resolvedUsername);
+        }
+      });
+  }, [tableauUsername, identityLoading]);
 
   const reloadWorkbook = useCallback(async () => {
     setWorkbookLoading(true);
@@ -101,48 +189,17 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (health === null) return;
-    if (needsUsername && !hasUsername) {
+    if (health === null || identityLoading) return;
+    if (health.authMode === "direct-trust" && !hasUsername) {
       setWorkbookLoading(false);
       return;
     }
     void reloadWorkbook();
-  }, [health, needsUsername, hasUsername, reloadWorkbook]);
+  }, [health, identityLoading, hasUsername, reloadWorkbook]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
-
-  const linkUsername = useCallback(async () => {
-    const cleaned = usernameDraft.trim();
-    if (!cleaned) {
-      setLinkError("Enter your Tableau username (e.g. demoAdmin or local\\demoAdmin).");
-      return;
-    }
-    setLinkingUser(true);
-    setLinkError(null);
-    try {
-      const res = await fetch(
-        apiUrl(`/api/auth/verify?tableauUsername=${encodeURIComponent(cleaned)}`)
-      );
-      const data = await readJson<{
-        tableauSignInOk?: boolean;
-        tableauHint?: string;
-        tableauError?: string;
-      }>(res);
-      if (!data.tableauSignInOk) {
-        throw new Error(
-          data.tableauHint || data.tableauError || "Sign-in failed for that username."
-        );
-      }
-      await persistTableauUsername(cleaned);
-      setTableauUsernameState(cleaned);
-    } catch (e) {
-      setLinkError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLinkingUser(false);
-    }
-  }, [usernameDraft]);
 
   const sendMessage = useCallback(
     async (text: string) => {
@@ -152,9 +209,9 @@ export function App() {
         setError("Connecting…");
         return;
       }
-      const user = getTableauUsername() || tableauUsername.trim();
-      if (needsUsername && !user) {
-        setError("Link your Tableau username first.");
+      const uid = getUniqueUserId();
+      if (health?.authMode === "direct-trust" && !uid) {
+        setError("Could not detect Tableau session (uniqueUserId).");
         return;
       }
 
@@ -182,8 +239,7 @@ export function App() {
                 }
               : {}),
             extensionMode: true,
-            ...(user ? { tableauUsername: user } : {}),
-            ...(getUniqueUserId() ? { uniqueUserId: getUniqueUserId() } : {}),
+            ...(uid ? { uniqueUserId: uid } : {}),
           }),
         });
         const data = await readJson<{
@@ -211,7 +267,7 @@ export function App() {
         textareaRef.current?.focus();
       }
     },
-    [loading, messages, selectedWorkbook, selectedDatasources, needsUsername, tableauUsername]
+    [loading, messages, selectedWorkbook, selectedDatasources, health]
   );
 
   const send = useCallback(() => void sendMessage(input), [input, sendMessage]);
@@ -236,12 +292,14 @@ export function App() {
     health?.ok &&
     workbookReady &&
     !workbookLoading &&
-    (!needsUsername || hasUsername);
+    !identityLoading &&
+    (health.authMode !== "direct-trust" || hasUsername);
 
   const statusMessage = (() => {
+    if (identityLoading) return "Detecting Tableau user…";
     if (health === null) return "Checking connection…";
     if (health.healthError) return health.healthError;
-    if (needsUsername && !hasUsername) return "Enter your Tableau username to continue";
+    if (identityFailed) return identityError || "Could not resolve Tableau user";
     if (workbookLoading) return "Connecting…";
     if (workbookError) return workbookError;
     if (!health.ok) {
@@ -261,9 +319,9 @@ export function App() {
   })();
 
   const statusClass =
-    health === null || workbookLoading || (needsUsername && !hasUsername)
+    health === null || workbookLoading || identityLoading
       ? "status-pill--loading"
-      : health?.healthError || workbookError || !health?.ok
+      : health?.healthError || workbookError || identityFailed || !health?.ok
         ? "status-pill--error"
         : "status-pill--ok";
 
@@ -293,36 +351,16 @@ export function App() {
           </div>
         </header>
 
-        {needsUsername && !hasUsername ? (
+        {identityFailed ? (
           <div className="user-link-card">
-            <h2>Link Tableau user</h2>
+            <h2>Could not detect Tableau user</h2>
             <p>
-              Chat runs as your Tableau account (Connected App). Enter the same username you use to
-              sign in — for example <code>demoAdmin</code> or <code>local\demoAdmin</code>.
+              This extension uses your signed-in Tableau session only. Open it from a dashboard
+              while logged in. Username entry is disabled to prevent impersonation.
             </p>
-            <div className="user-link-row">
-              <input
-                type="text"
-                value={usernameDraft}
-                onChange={(e) => setUsernameDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void linkUsername();
-                  }
-                }}
-                placeholder="Tableau username"
-                aria-label="Tableau username"
-                disabled={linkingUser}
-                autoComplete="username"
-              />
-              <button type="button" className="btn-send" onClick={() => void linkUsername()} disabled={linkingUser}>
-                {linkingUser ? "…" : "Continue"}
-              </button>
-            </div>
-            {linkError && (
+            {identityError && (
               <p className="composer-error" role="alert">
-                {linkError}
+                {identityError}
               </p>
             )}
           </div>
@@ -333,7 +371,8 @@ export function App() {
                 !loading &&
                 !selectedWorkbook &&
                 health?.ok &&
-                !workbookLoading && (
+                !workbookLoading &&
+                !identityLoading && (
                   <div className="empty-state-card">
                     <p>{workbookError ? "Could not connect to this dashboard." : "Connecting…"}</p>
                   </div>
@@ -390,7 +429,7 @@ export function App() {
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={onKeyDown}
                   placeholder={
-                    workbookLoading
+                    identityLoading || workbookLoading
                       ? "Connecting…"
                       : !health?.ok
                         ? "Connecting…"
@@ -399,7 +438,7 @@ export function App() {
                           : "Ask a question…"
                   }
                   rows={1}
-                  disabled={loading || workbookLoading}
+                  disabled={loading || workbookLoading || identityLoading}
                   aria-label="Message"
                 />
                 <button

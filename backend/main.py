@@ -22,12 +22,12 @@ from backend.chat_mode import get_tableau_chat_mode
 from backend.config import env
 from backend.datasources import (
     DatasourceSummary,
-    fetch_workbook_published_datasources,
     resolve_datasources_via_mcp,
     resolve_workbook_datasources,
 )
 from backend.runner import run_exclusive
-from backend.tableau_auth import auth_mode, connected_app_configured, resolve_jwt_username
+from backend.tableau_auth import auth_mode, connected_app_configured
+from backend.user_map import resolve_username
 from backend.tableau_fields import (
     check_metadata_api_access,
     fetch_published_datasource_fields,
@@ -74,20 +74,27 @@ class ChatRequest(BaseModel):
     uniqueUserId: Optional[str] = None
 
 
-def _require_tableau_user(username: Optional[str]) -> str | None:
-    """When Connected App is on, ensure we have a JWT username."""
+def _require_tableau_user(
+    username: Optional[str] = None,
+    unique_user_id: Optional[str] = None,
+) -> str | None:
+    """When Connected App is on, resolve JWT username from uniqueUserId only."""
+    _ = username  # ignored — never trust client-supplied Tableau username
     if not connected_app_configured():
-        return (username or "").strip() or None
-    user = resolve_jwt_username(username)
+        return None
+
+    resolved = resolve_username(unique_user_id=unique_user_id, tableau_username=None)
+    user = resolved.get("tableauUsername")
     if not user:
         raise HTTPException(
             status_code=401,
             detail=(
-                "Connected App auth requires tableauUsername "
-                "(your Tableau login, e.g. demoAdmin or local\\demoAdmin)."
+                resolved.get("hint")
+                or "Could not resolve Tableau user from uniqueUserId. "
+                "Open the extension while signed into Tableau so uniqueUserId is sent."
             ),
         )
-    return user
+    return str(user)
 
 
 def _parse_workbook(body: Optional[SelectedWorkbookBody]) -> Optional[SelectedWorkbook]:
@@ -145,50 +152,65 @@ app.add_middleware(
 
 
 @app.get("/api/health")
-def health(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
+def health(
+    uniqueUserId: Optional[str] = Query(None),
+    tableauUsername: Optional[str] = Query(None),  # ignored (compat); do not trust
+) -> dict[str, Any]:
     mode = auth_mode()
     has_openai = bool(env("OPENAI_API_KEY"))
     has_tableau = bool(env("TABLEAU_SERVER"))
     has_auth = mode != "none"
-    with tableau_user_context(tableauUsername):
-        tableau = (
-            probe_tableau_sign_in()
-            if has_tableau and has_auth
-            else {
-                "tableauSignInOk": False,
-                "authMode": mode,
-                "tableauHint": "Set Tableau Connected App or PAT vars in .env",
-            }
-        )
-    # Connected App without a username yet is still "configured" — UI asks for username.
-    ok = has_openai and has_tableau and has_auth and (
-        tableau.get("tableauSignInOk") is True
-        or (
-            mode == "direct-trust"
-            and tableau.get("requiresTableauUsername") is True
-            and not resolve_jwt_username(tableauUsername)
-        )
-    )
-    # Tighten: health.ok true when CA configured even before username (extension can proceed to link form)
-    if mode == "direct-trust" and has_openai and has_tableau:
-        ok = True
-    elif mode == "pat":
-        ok = has_openai and has_tableau and tableau.get("tableauSignInOk") is True
+    _ = tableauUsername
 
-    mcp_env = {}
+    resolved_user: str | None = None
+    resolve_meta: dict[str, Any] = {}
+    if mode == "direct-trust":
+        resolve_meta = resolve_username(unique_user_id=uniqueUserId, tableau_username=None)
+        resolved_user = resolve_meta.get("tableauUsername")  # type: ignore[assignment]
+
+    if mode == "pat" and has_tableau and has_auth:
+        tableau = probe_tableau_sign_in()
+        ok = has_openai and tableau.get("tableauSignInOk") is True
+    elif mode == "direct-trust" and has_openai and has_tableau:
+        ok = True
+        if resolved_user:
+            with tableau_user_context(resolved_user):
+                tableau = probe_tableau_sign_in()
+        else:
+            tableau = {
+                "tableauSignInOk": False,
+                "authMode": "direct-trust",
+                "tableauHint": (
+                    "Connected App ready. Extension must send uniqueUserId "
+                    "from the signed-in Tableau session."
+                ),
+            }
+    else:
+        ok = False
+        tableau = {
+            "tableauSignInOk": False,
+            "authMode": mode,
+            "tableauHint": "Set Tableau Connected App or PAT vars in .env",
+        }
+
+    mcp_env: dict[str, str] = {}
     try:
-        with tableau_user_context(tableauUsername or env("TABLEAU_JWT_SUB_CLAIM")):
-            if has_auth and (mode == "pat" or resolve_jwt_username(tableauUsername)):
+        with tableau_user_context(resolved_user or env("TABLEAU_JWT_SUB_CLAIM")):
+            if has_auth and (mode == "pat" or resolved_user or env("TABLEAU_JWT_SUB_CLAIM")):
                 mcp_env = mcp_tableau_env_summary()
     except Exception:
         mcp_env = {}
 
+    requires_uid = mode == "direct-trust" and not bool(resolved_user)
     return {
         "ok": ok,
         "hasOpenAi": has_openai,
         "hasTableau": has_tableau,
         "authMode": mode,
-        "requiresTableauUsername": mode == "direct-trust",
+        "requiresTableauUsername": False,
+        "requiresUniqueUserId": requires_uid,
+        "resolvedUsername": resolved_user or "",
+        "resolveSource": resolve_meta.get("source") or "",
         "chatMode": get_tableau_chat_mode(),
         "backend": "python",
         "mcpSiteName": mcp_env.get("SITE_NAME", env("TABLEAU_SITE_NAME")),
@@ -196,6 +218,7 @@ def health(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
         "mcpAuth": mcp_env.get("AUTH", mode),
         "mcpJwtSub": mcp_env.get("JWT_SUB_CLAIM", ""),
         **tableau,
+        "requiresUniqueUserId": requires_uid,
     }
 
 
@@ -206,6 +229,7 @@ async def api_resolve_workbook(
     contentUrl: Optional[str] = Query(None),
     projectName: Optional[str] = Query(None),
     tableauUsername: Optional[str] = Query(None),
+    uniqueUserId: Optional[str] = Query(None),
 ) -> dict[str, Any]:
     """Resolve workbook LUID by id, name, project, or contentUrl (for Tableau dashboard extensions)."""
     if not any(
@@ -220,7 +244,7 @@ async def api_resolve_workbook(
             detail="Provide query parameter workbookId=, name=, or contentUrl=",
         )
 
-    user = _require_tableau_user(tableauUsername)
+    user = _require_tableau_user(tableauUsername, uniqueUserId)
 
     try:
 
@@ -256,6 +280,7 @@ async def api_resolve_datasources(
     names: Optional[str] = Query(None, description="Comma-separated datasource names"),
     workbookId: Optional[str] = Query(None),
     tableauUsername: Optional[str] = Query(None),
+    uniqueUserId: Optional[str] = Query(None),
 ) -> dict[str, Any]:
     """Resolve published datasource LUIDs by name and/or workbook Metadata upstreams."""
     name_list = [n.strip() for n in (names or "").split(",") if n.strip()]
@@ -266,7 +291,7 @@ async def api_resolve_datasources(
             detail="Provide query parameter names= and/or workbookId=",
         )
 
-    user = _require_tableau_user(tableauUsername)
+    user = _require_tableau_user(tableauUsername, uniqueUserId)
 
     try:
 
@@ -297,12 +322,15 @@ async def api_resolve_datasources(
 
 
 @app.get("/api/workbooks")
-async def api_workbooks(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
+async def api_workbooks(
+    tableauUsername: Optional[str] = Query(None),
+    uniqueUserId: Optional[str] = Query(None),
+) -> dict[str, Any]:
     import logging
     import traceback
 
     log = logging.getLogger("uvicorn.error")
-    user = _require_tableau_user(tableauUsername)
+    user = _require_tableau_user(tableauUsername, uniqueUserId)
 
     try:
 
@@ -319,17 +347,73 @@ async def api_workbooks(tableauUsername: Optional[str] = Query(None)) -> dict[st
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/auth/resolve")
+@app.post("/api/auth/resolve")
+async def api_auth_resolve(
+    request: Request,
+    uniqueUserId: Optional[str] = Query(None),
+    tableauUsername: Optional[str] = Query(None),  # ignored — never trust for identity
+) -> dict[str, Any]:
+    """Resolve logged-in viewer from uniqueUserId only (no client username)."""
+    body_uid = None
+    if request.method == "POST":
+        try:
+            payload = await request.json()
+            if isinstance(payload, dict):
+                body_uid = payload.get("uniqueUserId")
+        except Exception:
+            payload = None
+
+    _ = tableauUsername
+    uid = (uniqueUserId or body_uid or "").strip() or None
+    result = resolve_username(unique_user_id=uid, tableau_username=None)
+
+    if result.get("resolved") and result.get("tableauUsername"):
+        with tableau_user_context(str(result["tableauUsername"])):
+            probe = probe_tableau_sign_in()
+        result["tableauSignInOk"] = probe.get("tableauSignInOk") is True
+        if probe.get("tableauHint"):
+            result["tableauHint"] = probe.get("tableauHint")
+        if probe.get("tableauError"):
+            result["tableauError"] = probe.get("tableauError")
+        if not result["tableauSignInOk"]:
+            result["resolved"] = False
+    else:
+        result["tableauSignInOk"] = False
+        result["ignoredClientUsername"] = True
+
+    return result
+
+
 @app.get("/api/auth/verify")
-def api_auth_verify(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
-    """Verify Connected App / PAT sign-in for a Tableau username."""
-    user = _require_tableau_user(tableauUsername) if connected_app_configured() else None
+def api_auth_verify(
+    uniqueUserId: Optional[str] = Query(None),
+    tableauUsername: Optional[str] = Query(None),  # ignored
+) -> dict[str, Any]:
+    """Verify Connected App session for the user resolved from uniqueUserId."""
+    _ = tableauUsername
+    if connected_app_configured():
+        user = _require_tableau_user(None, uniqueUserId)
+    else:
+        user = None
     with tableau_user_context(user):
-        return probe_tableau_sign_in()
+        out = probe_tableau_sign_in()
+    if user:
+        out["tableauUsername"] = user
+    out["ignoredClientUsername"] = True
+    return out
 
 
 @app.get("/api/metadata-check")
-def api_metadata_check(tableauUsername: Optional[str] = Query(None)) -> dict[str, Any]:
-    user = _require_tableau_user(tableauUsername) if connected_app_configured() else None
+def api_metadata_check(
+    tableauUsername: Optional[str] = Query(None),
+    uniqueUserId: Optional[str] = Query(None),
+) -> dict[str, Any]:
+    user = (
+        _require_tableau_user(tableauUsername, uniqueUserId)
+        if connected_app_configured()
+        else None
+    )
     try:
         with tableau_user_context(user):
             return check_metadata_api_access()
@@ -342,11 +426,16 @@ async def api_datasource_fields(
     luid: Optional[str] = Query(None),
     name: Optional[str] = Query(None),
     tableauUsername: Optional[str] = Query(None),
+    uniqueUserId: Optional[str] = Query(None),
 ) -> dict[str, Any]:
     identifier = (luid or name or "").strip()
     if not identifier:
         raise HTTPException(status_code=400, detail="Provide query parameter luid= or name=")
-    user = _require_tableau_user(tableauUsername) if connected_app_configured() else None
+    user = (
+        _require_tableau_user(tableauUsername, uniqueUserId)
+        if connected_app_configured()
+        else None
+    )
     try:
         with tableau_user_context(user):
             out = fetch_published_datasource_fields(identifier)
@@ -398,7 +487,7 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
             detail="OPENAI_API_KEY is not set in the server environment (.env).",
         )
 
-    user = _require_tableau_user(body.tableauUsername)
+    user = _require_tableau_user(None, body.uniqueUserId)
     workbook = _parse_workbook(body.selectedWorkbook)
     datasources = _parse_datasources(body.selectedDatasources)
     normalized: list[dict[str, str]] = []

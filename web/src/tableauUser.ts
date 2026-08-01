@@ -47,9 +47,9 @@ export function settingsUsernameKey(): string {
   return SETTINGS_KEY;
 }
 
-/** Append tableauUsername to API query strings when set. */
+/** Append uniqueUserId to API query strings (username is never sent for auth). */
 export function withTableauUser(qs: URLSearchParams): URLSearchParams {
-  const u = getTableauUsername();
-  if (u) qs.set("tableauUsername", u);
+  const id = getUniqueUserId();
+  if (id) qs.set("uniqueUserId", id);
   return qs;
 }

@@ -549,4 +549,4 @@ export async function persistTableauUsername(username: string): Promise<void> {
   }
 }
 
-export { getTableauUsername, getUniqueUserId, setTableauUsername, loadStoredTableauUsername };
+export { getTableauUsername, getUniqueUserId, setTableauUsername, setUniqueUserId, loadStoredTableauUsername };

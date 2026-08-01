@@ -8,3 +8,5 @@ __pycache__
 *.local
 .DS_Store
 benchmark-results/
+data/user_map.json
+data/*.tmp
