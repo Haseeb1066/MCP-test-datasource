@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "example-datasource",
+      "label": "Example Datasource",
+      "match": {
+        "luids": ["00000000-0000-0000-0000-000000000000"],
+        "names": ["Exact Published Name"],
+        "nameContains": ["Partial Name Match"]
+      },
+      "notes": "Put KPI / term definitions here. Field captions still come from get-datasource-metadata.\n- Example: customers = COUNTD(Customer Name).\n- Example: Active = Status field value \"Active\"."
+    },
+    {
+      "id": "accounts-payable",
+      "label": "Accounts Payable",
+      "match": {
+        "luids": [],
+        "names": [],
+        "nameContains": ["Accounts Payable", "AP Dashboard", "AccountsPayable"]
+      },
+      "notes": "After get-datasource-metadata, map user language to exact captions that exist.\n- Outstanding ≠ overdue. Use the matching flag/measure from metadata.\n- Short ≈ 1–15 days, Medium ≈ 16–30, Long ≈ 30+. Filter by term/band field; separate queries per segment.\n- Creditor counts: COUNTD(Creditor) with the right filters."
+    }
+  ]
+}

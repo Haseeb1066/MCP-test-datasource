@@ -15,6 +15,7 @@ from backend.chat_mode import (
 )
 from backend.config import env
 from backend.datasources import SelectedDatasource, fetch_fields_via_mcp_metadata
+from backend.glossary import format_glossary_prompt_block
 from backend.mcp_tableau import call_tool, list_tools, tool_result_to_text
 from backend.prompts import (
     DATASOURCE_ANALYST_SYSTEM,
@@ -121,6 +122,9 @@ def _build_system_prompt(
         parts.append(
             workbook_selection_prompt_block(selected_workbook, extension_mode=extension_mode)
         )
+    glossary = format_glossary_prompt_block(selected_datasources)
+    if glossary:
+        parts.append(glossary)
     extra = env("CHAT_SYSTEM_EXTRA")
     if extra:
         parts.append(f"Deployment notes:\n{extra}")

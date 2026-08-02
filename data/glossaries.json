@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "accounts-payable",
+      "label": "Accounts Payable",
+      "match": {
+        "luids": [],
+        "names": [],
+        "nameContains": ["Accounts Payable", "AP Dashboard", "AccountsPayable"]
+      },
+      "notes": "After get-datasource-metadata, map user language to exact captions that exist (examples only if present): Outstanding Amount, Total Outstanding Amount, Total Overdue Amount, Creditor, Invoice #, Invoice Amount, Due Date, Invoice Date, Cleared Flag, Clearing Date, _Is Invoice Outstanding Flag, _Is Invoice Overdue Flag, payment term / term band fields.\n\nDefinitions (use only when matching fields exist):\n- Outstanding = open / not cleared invoices (prefer outstanding flag or outstanding amount measures — not the same as overdue).\n- Overdue = past due and still unpaid (prefer overdue flag / overdue amount). Outstanding overdue = intersection (outstanding AND overdue), never substitute plain outstanding total.\n- Short payment terms = about 1–15 days. Medium = about 16–30 days. Long = over 30 days. Always filter by the term/band field from metadata; never reuse one unfiltered invoiced total for short/medium/long.\n- Number of creditors = COUNTD(Creditor) with the correct outstanding/overdue/term filter. Do not use row COUNT.\n- Aging / due-in-month questions: filter on Due Date (or the aging bucket field in metadata), not invoice date unless the user asks for invoiced period.\n- Per-creditor balances: SUM the outstanding or overdue measure filtered to that Creditor; aggregate — do not list raw lines and guess.\n- High / medium / low volume: only define from a volume band field in metadata or dashboard context; if missing, say the field is unknown — do not invent textbook definitions.\n- Creditor management / dashboard meaning questions: describe only from available fields/views; do not invent process essays."
+    }
+  ]
+}
