@@ -510,24 +510,22 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
         with tableau_user_context(user):
             scoped = list(datasources)
             use_datasource_mode = extension_mode or bool(scoped)
+            needs_luid = use_datasource_mode and (
+                not scoped or any(not d.id for d in scoped)
+            )
 
-            if scoped and any(not d.id for d in scoped):
+            if needs_luid:
                 await get_mcp_client(force_datasource_tools=True)
-                names = [d.name for d in scoped]
-                resolved = await resolve_datasources_via_mcp(
-                    names=names, exact_name_only=False, single_best=True
-                )
-                if resolved:
-                    scoped = resolved
-                elif workbook and workbook.id:
-                    scoped = await resolve_workbook_datasources(
+                resolved: list[DatasourceSummary] = []
+                names = [d.name for d in scoped if d.name]
+                if names:
+                    resolved = await resolve_datasources_via_mcp(
+                        names=names, exact_name_only=False, single_best=True
+                    )
+                if not resolved and workbook and workbook.id:
+                    resolved = await resolve_workbook_datasources(
                         workbook.id, workbook.name, workbook.content_url
                     )
-            elif extension_mode and workbook and workbook.id:
-                await get_mcp_client(force_datasource_tools=True)
-                resolved = await resolve_workbook_datasources(
-                    workbook.id, workbook.name, workbook.content_url
-                )
                 if resolved:
                     scoped = resolved
 
@@ -535,12 +533,16 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
             force_ds = use_datasource_mode or bool(scoped)
             published = [d for d in scoped if d.id]
             if force_ds and not published:
+                hint_names = ", ".join(d.name for d in scoped if d.name) or "(none detected)"
+                wid = workbook.id if workbook else ""
                 raise HTTPException(
                     status_code=503,
                     detail=(
                         "No published datasource LUID resolved for this dashboard. "
-                        "Enable API Access on the published datasource, confirm TABLEAU_SITE_NAME, "
-                        "then retry GET /api/datasources/resolve?workbookId=..."
+                        f"Detected names: {hint_names}. "
+                        "Publish the datasource (not an embedded Hyper extract), enable API Access, "
+                        "confirm TABLEAU_SITE_NAME, then retry "
+                        f"GET /api/datasources/resolve?workbookId={wid or '...'}"
                     ),
                 )
             # Always scope chat to a single primary datasource for this dashboard.

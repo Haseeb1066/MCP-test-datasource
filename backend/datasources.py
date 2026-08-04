@@ -9,9 +9,9 @@ from typing import Any
 
 import httpx
 
-from backend.config import httpx_verify
+from backend.config import env, httpx_verify
 from backend.mcp_tableau import call_tool, tool_result_to_text
-from backend.tableau_fields import _server_base, sign_in_pat
+from backend.tableau_fields import DEFAULT_REST_VERSION, _server_base, sign_in_pat
 from backend.workbooks import _extract_json_payload, _normalize_label
 
 
@@ -260,14 +260,66 @@ async def resolve_datasources_via_mcp(
 ) -> list[DatasourceSummary]:
     if not (names or ids):
         return []
-    all_ds = await list_datasources_via_mcp()
-    return resolve_datasources_from_list(
+    try:
+        all_ds = await list_datasources_via_mcp()
+    except RuntimeError:
+        all_ds = []
+    matched = resolve_datasources_from_list(
         all_ds,
         names=names,
         ids=ids,
         exact_name_only=exact_name_only,
         single_best=single_best,
     )
+    if matched:
+        return matched
+
+    # REST fallback when MCP list is empty / name not visible via MCP.
+    rest_hits: list[DatasourceSummary] = []
+    seen: set[str] = set()
+    for raw_name in names or []:
+        label = (raw_name or "").strip()
+        if not label:
+            continue
+        ds = fetch_published_datasource_by_name(label)
+        if ds and ds.id and ds.id not in seen:
+            seen.add(ds.id)
+            rest_hits.append(ds)
+    if single_best and len(rest_hits) > 1:
+        return pick_primary_datasource(rest_hits)
+    return rest_hits
+
+
+def fetch_published_datasource_by_name(name: str) -> DatasourceSummary | None:
+    """REST lookup of a published datasource by exact name (site-scoped)."""
+    label = (name or "").strip()
+    if not label:
+        return None
+    token, site_id = sign_in_pat()
+    if not site_id:
+        return None
+    version = _rest_version()
+    url = f"{_server_base()}/api/{version}/sites/{site_id}/datasources"
+    with httpx.Client(verify=httpx_verify(), timeout=120.0) as client:
+        res = client.get(
+            url,
+            headers={
+                "Accept": "application/json",
+                "X-Tableau-Auth": token,
+            },
+            params={"filter": f"name:eq:{label}"},
+        )
+    if not res.is_success:
+        return None
+    try:
+        payload = res.json()
+    except json.JSONDecodeError:
+        return None
+    parsed = _parse_rest_datasource_nodes(payload)
+    for ds in parsed:
+        if ds.id and _normalize_label(ds.name) == _normalize_label(label):
+            return ds
+    return parsed[0] if parsed and parsed[0].id else None
 
 
 def _workbook_match_tokens(workbook_name: str | None, content_url: str | None) -> set[str]:
@@ -292,6 +344,65 @@ def _workbook_match_tokens(workbook_name: str | None, content_url: str | None) -
     return {t for t in tokens if t and t not in _GENERIC_NAME_TOKENS and len(t) >= 4}
 
 
+def _workbook_datasource_aliases(
+    workbook_name: str | None, content_url: str | None
+) -> list[str]:
+    """Known published DS names when Metadata/workbook REST cannot discover upstreams."""
+    blob = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        f"{workbook_name or ''}{content_url or ''}".lower(),
+    )
+    aliases: list[str] = []
+    if "accountspayable" in blob:
+        aliases.extend(["AP Dataset", "Accounts Payable", "AP Data"])
+    return aliases
+
+
+def _resolve_workbook_ds_via_aliases(
+    workbook_name: str | None, content_url: str | None
+) -> list[DatasourceSummary]:
+    for alias in _workbook_datasource_aliases(workbook_name, content_url):
+        ds = fetch_published_datasource_by_name(alias)
+        if ds and ds.id:
+            return [ds]
+    return []
+
+
+def _score_workbook_ds_name(
+    ds_name: str,
+    tokens: set[str],
+    *,
+    workbook_name: str | None = None,
+    content_url: str | None = None,
+) -> int:
+    dn = re.sub(r"[^a-z0-9]+", "", (ds_name or "").lower())
+    if not dn:
+        return 0
+    score = 0
+    for token in tokens:
+        if dn == token:
+            score = max(score, 100)
+        elif dn.startswith(token) or token.startswith(dn):
+            if min(len(dn), len(token)) >= 6:
+                score = max(score, 55)
+        elif len(token) >= 8 and token in dn:
+            score = max(score, 40)
+    # Accounts Payable workbooks commonly use "AP Dataset" (tokens alone miss this).
+    wb_blob = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        f"{workbook_name or ''}{content_url or ''}".lower(),
+    )
+    if ("accountspayable" in tokens or "accountspayable" in wb_blob) and (
+        dn in {"apdataset", "apdata", "accountspayable", "accountspayables"}
+        or ("payable" in dn and "dataset" in dn)
+        or (dn.startswith("ap") and "dataset" in dn)
+    ):
+        score = max(score, 90)
+    return score
+
+
 async def resolve_workbook_datasources(
     workbook_id: str,
     workbook_name: str | None = None,
@@ -302,11 +413,18 @@ async def resolve_workbook_datasources(
     matched: list[DatasourceSummary] = []
 
     if wid:
+        # Prefer REST (works when Metadata GraphQL is 403).
+        rest = fetch_workbook_datasources_rest(wid)
+        published_rest = [d for d in rest if d.id]
+        if published_rest:
+            return pick_primary_datasource(published_rest)
+        matched.extend(rest)
+
         meta = fetch_workbook_published_datasources(wid)
-        published = [d for d in meta if d.id]
-        if published:
-            return pick_primary_datasource(published)
-        matched = meta
+        published_meta = [d for d in meta if d.id]
+        if published_meta:
+            return pick_primary_datasource(published_meta)
+        matched.extend(meta)
 
     try:
         all_ds = await list_datasources_via_mcp()
@@ -314,9 +432,12 @@ async def resolve_workbook_datasources(
         all_ds = []
 
     if not all_ds:
+        aliased = _resolve_workbook_ds_via_aliases(workbook_name, content_url)
+        if aliased:
+            return aliased
         return pick_primary_datasource([d for d in matched if d.id] or matched)
 
-    # Match metadata embedded names to published LUIDs (exact preferred).
+    # Match metadata/REST embedded names to published LUIDs (exact preferred).
     if matched:
         names = [d.name for d in matched if d.name]
         resolved = resolve_datasources_from_list(
@@ -328,25 +449,19 @@ async def resolve_workbook_datasources(
     tokens = _workbook_match_tokens(workbook_name, content_url)
     hits: list[tuple[int, DatasourceSummary]] = []
     for d in all_ds:
-        dn = re.sub(r"[^a-z0-9]+", "", (d.name or "").lower())
-        if not dn:
-            continue
-        score = 0
-        for token in tokens:
-            if dn == token:
-                score = max(score, 100)
-            elif dn.startswith(token) or token.startswith(dn):
-                # Avoid weak prefix matches on short leftovers.
-                if min(len(dn), len(token)) >= 6:
-                    score = max(score, 55)
-            elif len(token) >= 8 and token in dn:
-                score = max(score, 40)
+        score = _score_workbook_ds_name(
+            d.name, tokens, workbook_name=workbook_name, content_url=content_url
+        )
         if score >= 55:
             hits.append((score, d))
 
     if hits:
         hits.sort(key=lambda x: (-x[0], x[1].name.casefold()))
         return [hits[0][1]]
+
+    aliased = _resolve_workbook_ds_via_aliases(workbook_name, content_url)
+    if aliased:
+        return aliased
 
     return pick_primary_datasource([d for d in matched if d.id] or matched)
 
@@ -368,8 +483,97 @@ query WorkbookDatasources($luid: String!) {
 """
 
 
+def _rest_version() -> str:
+    return env("TABLEAU_REST_API_VERSION") or DEFAULT_REST_VERSION
+
+
+def _parse_rest_datasource_nodes(payload: Any) -> list[DatasourceSummary]:
+    """Normalize Tableau REST workbook datasources / connections JSON."""
+    out: list[DatasourceSummary] = []
+    seen: set[str] = set()
+
+    def _add(did: str, name: str, *, published: bool | None = True) -> None:
+        key = did or f"name:{name}"
+        if not name or key in seen:
+            return
+        seen.add(key)
+        out.append(DatasourceSummary(id=did, name=name, is_published=published))
+
+    if not isinstance(payload, dict):
+        return out
+
+    datasources = payload.get("datasources")
+    if isinstance(datasources, dict):
+        nodes = datasources.get("datasource")
+        if isinstance(nodes, dict):
+            nodes = [nodes]
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            did = node.get("id") or node.get("luid") or ""
+            name = node.get("name") or ""
+            if isinstance(did, str) and isinstance(name, str) and name:
+                _add(did, name, published=True)
+
+    connections = payload.get("connections")
+    if isinstance(connections, dict):
+        nodes = connections.get("connection")
+        if isinstance(nodes, dict):
+            nodes = [nodes]
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            # Prefer nested datasource object when present.
+            ds = node.get("datasource") if isinstance(node.get("datasource"), dict) else None
+            if ds:
+                did = ds.get("id") or ds.get("luid") or ""
+                name = ds.get("name") or node.get("datasourceName") or ""
+            else:
+                did = node.get("datasourceId") or node.get("id") or ""
+                name = node.get("datasourceName") or node.get("name") or ""
+            if isinstance(name, str) and name:
+                _add(did if isinstance(did, str) else "", name, published=bool(did))
+
+    return out
+
+
+def fetch_workbook_datasources_rest(workbook_luid: str) -> list[DatasourceSummary]:
+    """REST: published datasources attached to a workbook (no Metadata GraphQL)."""
+    wid = (workbook_luid or "").strip()
+    if not wid:
+        return []
+
+    token, site_id = sign_in_pat()
+    if not site_id:
+        return []
+    version = _rest_version()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Tableau-Auth": token,
+    }
+    base = f"{_server_base()}/api/{version}/sites/{site_id}/workbooks/{wid}"
+
+    with httpx.Client(verify=httpx_verify(), timeout=120.0) as client:
+        for path in ("datasources", "connections"):
+            res = client.get(f"{base}/{path}", headers=headers)
+            if not res.is_success:
+                continue
+            try:
+                payload = res.json()
+            except json.JSONDecodeError:
+                continue
+            parsed = _parse_rest_datasource_nodes(payload)
+            published = [d for d in parsed if d.id]
+            if published:
+                return published
+            if parsed:
+                return parsed
+    return []
+
+
 def fetch_workbook_published_datasources(workbook_luid: str) -> list[DatasourceSummary]:
-    """Metadata API fallback: published upstream datasources used by a workbook."""
+    """Metadata API: published upstream datasources used by a workbook."""
     wid = (workbook_luid or "").strip()
     if not wid:
         return []
