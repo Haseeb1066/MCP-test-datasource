@@ -149,19 +149,31 @@ async function attachDatasources(
   workbook: WorkbookSummary,
   detected: Array<{ name: string; isPublished?: boolean }> = []
 ): Promise<DatasourceSummary[]> {
-  const names = detected.map((d) => d.name);
+  // Prefer published datasources detected on this dashboard only.
+  const publishedDetected = detected.filter((d) => d.isPublished === true);
+  const namePool = (publishedDetected.length > 0 ? publishedDetected : detected).map((d) => d.name);
   const resolved = await resolveDatasources({
-    names: names.length ? names : undefined,
+    names: namePool.length ? namePool : undefined,
     workbookId: workbook.id,
   });
-  if (resolved.length > 0) return resolved;
+  if (resolved.length > 0) {
+    // Server already returns a single primary; keep first with id as safety.
+    const primary = resolved.find((d) => d.id) ?? resolved[0];
+    return primary ? [primary] : [];
+  }
 
   // Fall back to detected names without server LUID (chat will try resolve again)
-  return detected.map((d) => ({
-    id: "",
-    name: d.name,
-    isPublished: d.isPublished,
-  }));
+  if (namePool.length === 0) return [];
+  const fallback = detected.find((d) => d.name === namePool[0]) ?? detected[0];
+  return fallback
+    ? [
+        {
+          id: "",
+          name: fallback.name,
+          isPublished: fallback.isPublished,
+        },
+      ]
+    : [];
 }
 
 /**

@@ -22,6 +22,7 @@ from backend.chat_mode import get_tableau_chat_mode
 from backend.config import env
 from backend.datasources import (
     DatasourceSummary,
+    pick_primary_datasource,
     resolve_datasources_via_mcp,
     resolve_workbook_datasources,
 )
@@ -301,7 +302,12 @@ async def api_resolve_datasources(
                 matched: list[DatasourceSummary] = []
 
                 if name_list:
-                    matched = await resolve_datasources_via_mcp(names=name_list)
+                    # Dashboard-detected names first (exact preferred); keep one primary DS.
+                    matched = await resolve_datasources_via_mcp(
+                        names=name_list,
+                        exact_name_only=False,
+                        single_best=True,
+                    )
 
                 if wid and not matched:
                     wb = await resolve_workbook_via_mcp(workbook_id=wid)
@@ -311,7 +317,7 @@ async def api_resolve_datasources(
                         wb.content_url if wb else None,
                     )
 
-                return [d.to_api_dict() for d in matched]
+                return [d.to_api_dict() for d in pick_primary_datasource(matched)]
 
         datasources = await run_exclusive(_run)
         return {"datasources": datasources}
@@ -508,7 +514,9 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
             if scoped and any(not d.id for d in scoped):
                 await get_mcp_client(force_datasource_tools=True)
                 names = [d.name for d in scoped]
-                resolved = await resolve_datasources_via_mcp(names=names)
+                resolved = await resolve_datasources_via_mcp(
+                    names=names, exact_name_only=False, single_best=True
+                )
                 if resolved:
                     scoped = resolved
                 elif workbook and workbook.id:
@@ -535,7 +543,8 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
                         "then retry GET /api/datasources/resolve?workbookId=..."
                     ),
                 )
-            scoped = published or scoped
+            # Always scope chat to a single primary datasource for this dashboard.
+            scoped = pick_primary_datasource(published or scoped)
 
             return await run_agent_turn(
                 openai_client,

@@ -154,11 +154,45 @@ async def fetch_fields_via_mcp_metadata(datasource_luid: str) -> dict[str, Any]:
     return parse_fields_from_mcp_metadata(payload, datasource_luid=luid)
 
 
+_GENERIC_NAME_TOKENS = frozenset(
+    {
+        "ai",
+        "mcp",
+        "data",
+        "dataset",
+        "extract",
+        "source",
+        "sources",
+        "sales",
+        "demo",
+        "test",
+        "v1",
+        "v2",
+        "dashboard",
+        "workbook",
+        "ap",
+    }
+)
+
+
+def pick_primary_datasource(datasources: list[DatasourceSummary]) -> list[DatasourceSummary]:
+    """Keep a single primary published datasource for dashboard-scoped chat."""
+    published = [d for d in datasources if d.id and d.is_published is not False]
+    if published:
+        return [published[0]]
+    with_id = [d for d in datasources if d.id]
+    if with_id:
+        return [with_id[0]]
+    return datasources[:1] if datasources else []
+
+
 def resolve_datasources_from_list(
     all_datasources: list[DatasourceSummary],
     *,
     names: list[str] | None = None,
     ids: list[str] | None = None,
+    exact_name_only: bool = False,
+    single_best: bool = True,
 ) -> list[DatasourceSummary]:
     """Match published datasources by id and/or name (case-insensitive)."""
     by_id = {d.id.casefold(): d for d in all_datasources}
@@ -169,32 +203,51 @@ def resolve_datasources_from_list(
     matched: list[DatasourceSummary] = []
     seen: set[str] = set()
 
+    def _add(ds: DatasourceSummary) -> None:
+        if ds.id not in seen:
+            seen.add(ds.id)
+            matched.append(ds)
+
     for raw_id in ids or []:
         key = (raw_id or "").strip().casefold()
         if not key:
             continue
         ds = by_id.get(key)
-        if ds and ds.id not in seen:
-            seen.add(ds.id)
-            matched.append(ds)
+        if ds:
+            _add(ds)
 
     for raw_name in names or []:
         label = _normalize_label(raw_name)
         if not label:
             continue
-        candidates = by_name.get(label) or []
-        if not candidates:
-            candidates = [
-                d
-                for d in all_datasources
-                if label in _normalize_label(d.name) or _normalize_label(d.name) in label
-            ]
-        for ds in candidates:
-            if ds.id not in seen:
-                seen.add(ds.id)
-                matched.append(ds)
-                break
+        exact = by_name.get(label) or []
+        if exact:
+            _add(exact[0])
+            continue
+        if exact_name_only:
+            continue
+        # Score partial matches; take only the best for this name.
+        scored: list[tuple[int, DatasourceSummary]] = []
+        for d in all_datasources:
+            dn = _normalize_label(d.name)
+            if not dn:
+                continue
+            score = 0
+            if dn == label:
+                score = 100
+            elif dn.startswith(label) or label.startswith(dn):
+                score = 50
+            elif label in dn or dn in label:
+                score = 25
+            if score > 0:
+                scored.append((score, d))
+        if not scored:
+            continue
+        scored.sort(key=lambda x: (-x[0], x[1].name.casefold()))
+        _add(scored[0][1])
 
+    if single_best and len(matched) > 1:
+        return pick_primary_datasource(matched)
     return matched
 
 
@@ -202,11 +255,41 @@ async def resolve_datasources_via_mcp(
     *,
     names: list[str] | None = None,
     ids: list[str] | None = None,
+    exact_name_only: bool = False,
+    single_best: bool = True,
 ) -> list[DatasourceSummary]:
     if not (names or ids):
         return []
     all_ds = await list_datasources_via_mcp()
-    return resolve_datasources_from_list(all_ds, names=names, ids=ids)
+    return resolve_datasources_from_list(
+        all_ds,
+        names=names,
+        ids=ids,
+        exact_name_only=exact_name_only,
+        single_best=single_best,
+    )
+
+
+def _workbook_match_tokens(workbook_name: str | None, content_url: str | None) -> set[str]:
+    tokens: set[str] = set()
+
+    def _add_raw(raw: str) -> None:
+        compact = re.sub(r"[^a-z0-9]+", "", raw.lower())
+        if compact and len(compact) >= 4 and compact not in _GENERIC_NAME_TOKENS:
+            tokens.add(compact)
+        for part in re.split(r"[^a-z0-9]+", raw.lower()):
+            if len(part) >= 4 and part not in _GENERIC_NAME_TOKENS:
+                tokens.add(part)
+
+    for raw in (workbook_name, content_url):
+        if not raw:
+            continue
+        _add_raw(raw)
+        _add_raw(raw.split("(")[0])
+    for t in list(tokens):
+        if "payable" in t or "accountspayable" in t:
+            tokens.add("accountspayable")
+    return {t for t in tokens if t and t not in _GENERIC_NAME_TOKENS and len(t) >= 4}
 
 
 async def resolve_workbook_datasources(
@@ -214,7 +297,7 @@ async def resolve_workbook_datasources(
     workbook_name: str | None = None,
     content_url: str | None = None,
 ) -> list[DatasourceSummary]:
-    """Resolve published datasources for a workbook: Metadata API, then MCP name match."""
+    """Resolve the primary published datasource for a workbook (at most one)."""
     wid = (workbook_id or "").strip()
     matched: list[DatasourceSummary] = []
 
@@ -222,7 +305,7 @@ async def resolve_workbook_datasources(
         meta = fetch_workbook_published_datasources(wid)
         published = [d for d in meta if d.id]
         if published:
-            return published
+            return pick_primary_datasource(published)
         matched = meta
 
     try:
@@ -231,56 +314,41 @@ async def resolve_workbook_datasources(
         all_ds = []
 
     if not all_ds:
-        return [d for d in matched if d.id] or matched
+        return pick_primary_datasource([d for d in matched if d.id] or matched)
 
-    # Match metadata embedded names to published LUIDs
+    # Match metadata embedded names to published LUIDs (exact preferred).
     if matched:
         names = [d.name for d in matched if d.name]
-        resolved = resolve_datasources_from_list(all_ds, names=names)
+        resolved = resolve_datasources_from_list(
+            all_ds, names=names, exact_name_only=False, single_best=True
+        )
         if resolved:
-            return resolved
+            return pick_primary_datasource(resolved)
 
-    tokens: set[str] = set()
-    for raw in (workbook_name, content_url):
-        if not raw:
-            continue
-        norm = _normalize_label(raw)
-        if norm:
-            tokens.add(norm)
-        # Accounts Payable (AI-MCP) -> accountspayable
-        base = _normalize_label(raw.split("(")[0])
-        if base:
-            tokens.add(base)
-        # AccountsPayableAI-MCP -> accountspayableaimcp, ap from AP prefix patterns
-        for part in re.split(r"[^a-z0-9]+", raw.lower()):
-            if len(part) >= 2:
-                tokens.add(part)
-        if "payable" in norm or "accountspayable" in norm:
-            tokens.add("ap")
-
+    tokens = _workbook_match_tokens(workbook_name, content_url)
     hits: list[tuple[int, DatasourceSummary]] = []
     for d in all_ds:
-        dn = _normalize_label(d.name)
+        dn = re.sub(r"[^a-z0-9]+", "", (d.name or "").lower())
+        if not dn:
+            continue
         score = 0
         for token in tokens:
-            if len(token) < 2:
-                continue
             if dn == token:
-                score += 100
+                score = max(score, 100)
             elif dn.startswith(token) or token.startswith(dn):
-                score += 40
-            elif token in dn:
-                score += 20
-        if score > 0:
+                # Avoid weak prefix matches on short leftovers.
+                if min(len(dn), len(token)) >= 6:
+                    score = max(score, 55)
+            elif len(token) >= 8 and token in dn:
+                score = max(score, 40)
+        if score >= 55:
             hits.append((score, d))
 
     if hits:
         hits.sort(key=lambda x: (-x[0], x[1].name.casefold()))
-        top_score = hits[0][0]
-        # Keep only strong matches (within 15 points of best) to avoid weak token hits.
-        return [d for s, d in hits if s >= max(top_score - 15, 20)]
+        return [hits[0][1]]
 
-    return [d for d in matched if d.id] or matched
+    return pick_primary_datasource([d for d in matched if d.id] or matched)
 
 
 _WORKBOOK_DS_QUERY = """

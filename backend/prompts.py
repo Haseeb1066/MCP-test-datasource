@@ -62,14 +62,18 @@ def datasource_selection_prompt_block(
     extension_mode: bool = False,
 ) -> str:
     scope = (
-        "This chat runs inside a Tableau dashboard extension. Use ONLY the published datasources connected to this dashboard:"
+        "This chat runs inside a Tableau dashboard extension. Use ONLY this dashboard's primary published datasource:"
         if extension_mode
-        else "The user scoped this chat to these published datasources — use ONLY these:"
+        else "The user scoped this chat to this published datasource — use ONLY it:"
     )
     lines = [scope]
     if workbook:
         lines.append(f"Dashboard workbook: {workbook.name} (workbookId {workbook.id})")
-    for ds in datasources:
+    primary = next((d for d in datasources if d.id and d.is_published is not False), None)
+    if primary is None:
+        primary = next((d for d in datasources if d.id), None)
+    focus = [primary] if primary else list(datasources[:1])
+    for ds in focus:
         published = ""
         if ds.is_published is False:
             published = " [embedded only — cannot query-datasource]"
@@ -79,15 +83,12 @@ def datasource_selection_prompt_block(
             lines.append(f'- name: "{ds.name}" · datasourceLuid: {ds.id}{published}')
         else:
             lines.append(f'- name: "{ds.name}"{published} (no published LUID)')
-    published_with_id = [d for d in datasources if d.id and d.is_published is not False]
-    if published_with_id:
-        first = published_with_id[0]
+    if primary and primary.id and primary.is_published is not False:
         lines.append(
-            f'Skip broad list-datasources. Call get-datasource-metadata with datasourceLuid "{first.id}" '
-            f'(preferred), or {LOCAL_DATASOURCE_FIELDS_TOOL} with identifier "{first.id}" / "{first.name}". '
-            f'Then query-datasource with datasourceLuid "{first.id}" using exact field captions from metadata. '
-            "If multiple datasources are listed, pick the one that matches the user's question "
-            "(name / metrics), then always load THAT datasource's metadata before querying."
+            f'Do NOT call list-datasources and do NOT query any other datasource. '
+            f'Call get-datasource-metadata with datasourceLuid "{primary.id}" '
+            f'(preferred), or {LOCAL_DATASOURCE_FIELDS_TOOL} with identifier "{primary.id}" / "{primary.name}". '
+            f'Then query-datasource with datasourceLuid "{primary.id}" only, using exact field captions from metadata.'
         )
     else:
         lines.append(
