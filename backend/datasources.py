@@ -356,6 +356,9 @@ def _workbook_datasource_aliases(
     aliases: list[str] = []
     if "accountspayable" in blob:
         aliases.extend(["AP Dataset", "Accounts Payable", "AP Data"])
+    # Sales_AI-MCP uses an embedded Hyper extract; site publishes "Sales Data".
+    if "salesaimcp" in blob or ("salesai" in blob and "mcp" in blob):
+        aliases.extend(["Sales Data", "Sales Data Extract", "Sales Pipeline"])
     return aliases
 
 
@@ -388,18 +391,25 @@ def _score_workbook_ds_name(
                 score = max(score, 55)
         elif len(token) >= 8 and token in dn:
             score = max(score, 40)
-    # Accounts Payable workbooks commonly use "AP Dataset" (tokens alone miss this).
     wb_blob = re.sub(
         r"[^a-z0-9]+",
         "",
         f"{workbook_name or ''}{content_url or ''}".lower(),
     )
+    # Accounts Payable workbooks commonly use "AP Dataset" (tokens alone miss this).
     if ("accountspayable" in tokens or "accountspayable" in wb_blob) and (
         dn in {"apdataset", "apdata", "accountspayable", "accountspayables"}
         or ("payable" in dn and "dataset" in dn)
         or (dn.startswith("ap") and "dataset" in dn)
     ):
         score = max(score, 90)
+    # Sales_AI-MCP → published "Sales Data" (not the embedded extract name).
+    if ("salesaimcp" in wb_blob or "salesai" in wb_blob) and dn in {
+        "salesdata",
+        "salesdataextract",
+        "salespipeline",
+    }:
+        score = max(score, 90 if dn == "salesdata" else 70)
     return score
 
 

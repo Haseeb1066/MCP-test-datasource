@@ -535,13 +535,19 @@ async def api_chat(body: ChatRequest) -> dict[str, Any]:
             if force_ds and not published:
                 hint_names = ", ".join(d.name for d in scoped if d.name) or "(none detected)"
                 wid = workbook.id if workbook else ""
+                wb_label = ""
+                if workbook:
+                    wb_label = (workbook.name or workbook.content_url or "").strip()
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "No published datasource LUID resolved for this dashboard. "
+                        "No published datasource LUID resolved for this dashboard"
+                        + (f" ({wb_label})" if wb_label else "")
+                        + ". "
                         f"Detected names: {hint_names}. "
-                        "Publish the datasource (not an embedded Hyper extract), enable API Access, "
-                        "confirm TABLEAU_SITE_NAME, then retry "
+                        "This usually means the dashboard uses an embedded Hyper extract. "
+                        "Publish that datasource (or replace the connection with a published one), "
+                        "enable API Access, confirm TABLEAU_SITE_NAME, then retry "
                         f"GET /api/datasources/resolve?workbookId={wid or '...'}"
                     ),
                 )

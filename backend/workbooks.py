@@ -44,8 +44,8 @@ def _parse_workbook_row(raw: Any) -> WorkbookSummary | None:
     project = raw.get("project") if isinstance(raw.get("project"), dict) else None
     return WorkbookSummary(
         id=wid,
-        name=name,
-        content_url=raw.get("contentUrl") if isinstance(raw.get("contentUrl"), str) else None,
+        name=name.strip(),
+        content_url=raw.get("contentUrl").strip() if isinstance(raw.get("contentUrl"), str) else None,
         project_name=project.get("name") if project and isinstance(project.get("name"), str) else None,
         default_view_id=raw.get("defaultViewId") if isinstance(raw.get("defaultViewId"), str) else None,
         webpage_url=raw.get("webpageUrl") if isinstance(raw.get("webpageUrl"), str) else None,
