@@ -1,9 +1,10 @@
 services:
   - type: web
     name: mcp-test
+    # Node runtime (existing service). Python is available as python3 for uvicorn.
     runtime: node
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: pip3 install -r requirements.txt && npm install && npm run build
+    startCommand: python3 -m uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: NODE_VERSION
         value: "20"
