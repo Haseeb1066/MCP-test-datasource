@@ -20,10 +20,12 @@ ANALYST_ACCURACY_RULES = """Accuracy rules (strict — every datasource / workbo
 4) Distinct entities ("how many customers/creditors/invoices"): use COUNTD on the entity field, not row COUNT.
 5) Different segments need different queries — never return the same total for short/medium/long (or similar) unless data proves it.
 6) Aggregate before answering "total" / "largest" / "top" — do not list raw rows and guess a sum unless the tool already aggregated.
-7) Definitions (what "short term" / "high volume" means): only answer from field values, calculated fields, dashboard context, or Deployment notes. If unknown, say you need the field used in this datasource — do not invent generic textbook definitions as facts.
-8) If a tool fails or returns empty, say what failed; do not fabricate numbers.
-9) Prefer one clear number (or short table) with the filter context used (e.g. "overdue only, as-of tool result").
-10) Sanity-check: if the answer looks identical to a previous unrelated question, re-query with corrected filters."""
+7) Aggregation from metadata: if defaultAggregation is AGG (or the measure is already a "Total …" calc), query with NO function — never wrap in SUM. If the error says cannot further aggregate, drop the function and retry.
+8) Historic periods ("Aug 2021", "Q3 2020"): filter a real date dimension with that range. Do not use "Current Month" / "Current Year" / "Previous …" calc fields for historic questions.
+9) Definitions (what "short term" / "high volume" means): only answer from field values, calculated fields, dashboard context, or Deployment notes. If unknown, say you need the field used in this datasource — do not invent generic textbook definitions as facts.
+10) If a tool fails or returns empty, say what failed; do not fabricate numbers.
+11) Prefer one clear number (or short table) with the filter context used (e.g. "August 2021 only, as-of tool result").
+12) Sanity-check: if the answer looks identical to a previous unrelated question, re-query with corrected filters."""
 
 
 def workbook_selection_prompt_block(
@@ -127,8 +129,9 @@ Do NOT call get-workbook, get-view-data, get-view-image, list-views, or list-wor
 Field discovery (required for every new datasource or question topic):
 1) Call get-datasource-metadata with datasourceLuid — use returned field "name" values as fieldCaption (exact).
 2) If that fails, call {LOCAL_DATASOURCE_FIELDS_TOOL}.
-3) Map the user's words to real captions (e.g. "overdue" → a flag/measure that exists in metadata). Never invent captions.
-4) Optional examples of captions that appear in some AP datasets (ONLY if metadata contains them):
+3) Read defaultAggregation / columnClass: if AGG (or already-aggregated "Total …" calc), omit function in query-datasource.
+4) Map the user's words to real captions (e.g. "overdue" → a flag/measure that exists in metadata). Never invent captions.
+5) Optional examples of captions that appear in some AP datasets (ONLY if metadata contains them):
    "Outstanding Amount", "Invoice #", "Creditor", "Invoice Amount", "Cleared Flag", "Clearing Date",
    "Due Date", "Invoice Date", "Total Outstanding Amount", "Total Overdue Amount",
    "_Is Invoice Outstanding Flag", "_Is Invoice Overdue Flag". Other datasources will have different names — always trust metadata.
@@ -136,9 +139,10 @@ Field discovery (required for every new datasource or question topic):
 Workflow:
 1) Use the scoped datasourceLuid from the system message (skip broad list-datasources when provided)
 2) get-datasource-metadata (or {LOCAL_DATASOURCE_FIELDS_TOOL})
-3) query-datasource with exact captions, correct aggregations (SUM/COUNTD), and required filters
+3) query-datasource with exact captions, correct aggregations (no SUM on AGG fields; SUM/COUNTD only on raw measures), and required filters (date range for historic months)
 4) If the user asks about multiple segments, query each segment separately
-5) search-content only if needed
+5) On "cannot be further aggregated" errors: retry the same fieldCaption with no function
+6) search-content only if needed
 
 {CURRENCY_PRESENTATION_RULES}
 
