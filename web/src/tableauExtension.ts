@@ -145,6 +145,25 @@ async function collectTableauDatasources(dashboard: TableauDashboard): Promise<
   return [...byName.values()];
 }
 
+/** Always keep exactly one primary datasource for dashboard-scoped chat. */
+function pickPrimaryDatasource(datasources: DatasourceSummary[]): DatasourceSummary | null {
+  if (!datasources.length) return null;
+  return (
+    datasources.find((d) => !!d.id && d.isPublished !== false) ??
+    datasources.find((d) => !!d.id) ??
+    datasources[0] ??
+    null
+  );
+}
+
+function withPrimaryDatasource(ctx: ExtensionContext): ExtensionContext {
+  const primary = pickPrimaryDatasource(ctx.datasources);
+  return {
+    ...ctx,
+    datasources: primary ? [primary] : [],
+  };
+}
+
 async function attachDatasources(
   workbook: WorkbookSummary,
   detected: Array<{ name: string; isPublished?: boolean }> = []
@@ -157,12 +176,11 @@ async function attachDatasources(
     workbookId: workbook.id,
   });
   if (resolved.length > 0) {
-    // Server already returns a single primary; keep first with id as safety.
-    const primary = resolved.find((d) => d.id) ?? resolved[0];
+    const primary = pickPrimaryDatasource(resolved);
     return primary ? [primary] : [];
   }
 
-  // Fall back to detected names without server LUID (chat will try resolve again)
+  // Fall back to a single detected name without server LUID (chat will try resolve again)
   if (namePool.length === 0) return [];
   const fallback = detected.find((d) => d.name === namePool[0]) ?? detected[0];
   return fallback
@@ -608,14 +626,18 @@ async function loadFromTableauHost(test: ReturnType<typeof testParamsFromQuery>)
     .map((r) => r.value);
   if (contexts.length === 0) {
     throw new Error(
-      "Could not detect workbook for this dashboard. Allowlist https://mcp-test-ldxl.onrender.com on Tableau Server (site demo), then reload."
+      "Could not detect workbook for this dashboard. Allowlist the extension URL on Tableau Server, then reload."
     );
   }
-  return (
-    contexts.find((c) => c.datasources.length > 0) ??
-    contexts.find((c) => c.source !== "referrer-contentUrl") ??
-    contexts[0]
-  );
+  // Prefer a context that already resolved a single primary datasource (fewest first).
+  const ranked = [...contexts].sort((a, b) => {
+    const aN = a.datasources.filter((d) => d.id).length || a.datasources.length;
+    const bN = b.datasources.filter((d) => d.id).length || b.datasources.length;
+    if (aN === 0 && bN > 0) return 1;
+    if (bN === 0 && aN > 0) return -1;
+    return aN - bN;
+  });
+  return withPrimaryDatasource(ranked[0]);
 }
 
 async function loadFromLocalTest(test: ReturnType<typeof testParamsFromQuery>): Promise<ExtensionContext> {
@@ -670,10 +692,10 @@ export async function loadExtensionContext(): Promise<ExtensionContext> {
   if (fromQuery) setTableauUsername(fromQuery);
   else loadStoredTableauUsername();
 
-  if (isTableauHost()) {
-    return loadFromTableauHost(test);
-  }
-  return loadFromLocalTest(test);
+  const ctx = isTableauHost()
+    ? await loadFromTableauHost(test)
+    : await loadFromLocalTest(test);
+  return withPrimaryDatasource(ctx);
 }
 
 /** Persist Tableau username in extension settings when available. */

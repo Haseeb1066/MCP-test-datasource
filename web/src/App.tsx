@@ -64,7 +64,15 @@ export function App() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const selectedWorkbook = extensionContext?.workbook ?? null;
-  const selectedDatasources = extensionContext?.datasources ?? [];
+  const selectedDatasources = (() => {
+    const all = extensionContext?.datasources ?? [];
+    if (all.length <= 1) return all;
+    const primary =
+      all.find((d) => !!d.id && d.isPublished !== false) ??
+      all.find((d) => !!d.id) ??
+      all[0];
+    return primary ? [primary] : [];
+  })();
   const hasUsername = !!tableauUsername.trim();
   const identityFailed =
     !identityLoading && health?.authMode === "direct-trust" && !hasUsername;
@@ -286,9 +294,11 @@ export function App() {
       return "Set Tableau Connected App or PAT on the server";
     }
     if (selectedWorkbook && selectedDatasources.length > 0) {
-      const n = selectedDatasources.length;
       const who = tableauUsername ? ` · ${tableauUsername}` : "";
-      return `Connected · ${n} datasource${n === 1 ? "" : "s"}${who}`;
+      const dsName = selectedDatasources[0]?.name?.trim();
+      return dsName
+        ? `Connected · 1 datasource (${dsName})${who}`
+        : `Connected · 1 datasource${who}`;
     }
     if (selectedWorkbook) {
       return tableauUsername ? `Connected · ${tableauUsername}` : "Connected";
