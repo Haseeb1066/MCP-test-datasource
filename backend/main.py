@@ -19,29 +19,27 @@ from pydantic import BaseModel
 from backend.auth_context import tableau_user_context
 from backend.chat import run_agent_turn
 from backend.chat_mode import get_tableau_chat_mode
-from backend.config import env
+from backend.config import env, httpx_client, httpx_verify
 from backend.datasources import (
     DatasourceSummary,
     pick_primary_datasource,
     resolve_datasources_via_mcp,
     resolve_workbook_datasources,
 )
+from backend.mcp_tableau import get_mcp_client, mcp_tableau_env_summary
 from backend.runner import run_exclusive
-from backend.tableau_auth import auth_mode, connected_app_configured
-from backend.user_map import resolve_username
+from backend.tableau_auth import auth_mode, connected_app_configured, probe_tableau_sign_in, sign_in_with_jwt
 from backend.tableau_fields import (
     check_metadata_api_access,
     fetch_published_datasource_fields,
-    probe_tableau_sign_in,
 )
+from backend.user_map import resolve_username
 from backend.workbooks import (
     SelectedWorkbook,
     WorkbookSummary,
     list_workbooks_via_mcp,
     resolve_workbook_via_mcp,
 )
-from backend.mcp_tableau import get_mcp_client, mcp_tableau_env_summary
-
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIST = ROOT / "dist" / "web"
 
@@ -176,7 +174,7 @@ def health(
         ok = True
         if resolved_user:
             with tableau_user_context(resolved_user):
-                tableau = probe_tableau_sign_in()
+                tableau = probe_tableau_sign_in(timeout=20.0)
         else:
             tableau = {
                 "tableauSignInOk": False,
@@ -221,6 +219,106 @@ def health(
         **tableau,
         "requiresUniqueUserId": requires_uid,
     }
+
+
+@app.get("/api/tableau-ping")
+def api_tableau_ping(
+    uniqueUserId: Optional[str] = Query("2b6034d2-ed3b-40f2-837c-ddd04d64b1dd"),
+) -> dict[str, Any]:
+    """
+    Diagnose host → Tableau Server reachability (use after deploy).
+    Default uniqueUserId is demoAdmin's site LUID.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    server = (env("TABLEAU_SERVER") or "").rstrip("/")
+    out: dict[str, Any] = {
+        "server": server,
+        "siteName": env("TABLEAU_SITE_NAME"),
+        "sslVerify": httpx_verify(),
+        "authMode": auth_mode(),
+    }
+    if not server:
+        out["ok"] = False
+        out["error"] = "TABLEAU_SERVER not set"
+        return out
+
+    host = urlparse(server).hostname or server.replace("https://", "").replace("http://", "")
+    # DNS
+    t0 = time.time()
+    try:
+        ips = sorted({i[4][0] for i in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)})
+        out["dns"] = {"ok": True, "ips": ips, "ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        out["dns"] = {"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)}
+        out["ok"] = False
+        return out
+
+    # TCP
+    t0 = time.time()
+    try:
+        with socket.create_connection((host, 443), timeout=10):
+            pass
+        out["tcp443"] = {"ok": True, "ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        out["tcp443"] = {"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)}
+        out["ok"] = False
+        out["hint"] = (
+            "This host cannot open TCP 443 to Tableau. "
+            "Firewall must allow outbound HTTPS to TABLEAU_SERVER, "
+            "or run the app on a Windows server that can reach Tableau."
+        )
+        return out
+
+    # HTTPS GET
+    t0 = time.time()
+    try:
+        with httpx_client(timeout=15.0) as client:
+            res = client.get(server, follow_redirects=True)
+        out["https"] = {"ok": True, "status": res.status_code, "ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        out["https"] = {"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)}
+        out["ok"] = False
+        out["hint"] = (
+            "HTTPS to Tableau failed. Set TABLEAU_SSL_VERIFY=0 for private CA, "
+            "and confirm TABLEAU_SERVER is reachable from this host."
+        )
+        return out
+
+    # Map + JWT
+    resolved = resolve_username(unique_user_id=uniqueUserId, tableau_username=None)
+    out["resolve"] = {
+        "resolved": bool(resolved.get("resolved")),
+        "username": resolved.get("tableauUsername"),
+        "source": resolved.get("source"),
+        "queryUsersError": resolved.get("queryUsersError"),
+    }
+    user = resolved.get("tableauUsername") or env("TABLEAU_JWT_SUB_CLAIM") or "demoAdmin"
+    t0 = time.time()
+    try:
+        with tableau_user_context(str(user)):
+            token, site_id = sign_in_with_jwt(str(user), timeout=20.0)
+        out["jwtSignIn"] = {
+            "ok": True,
+            "username": user,
+            "siteIdPrefix": (site_id or "")[:8],
+            "ms": int((time.time() - t0) * 1000),
+        }
+        out["ok"] = True
+    except Exception as e:
+        out["jwtSignIn"] = {
+            "ok": False,
+            "username": user,
+            "error": str(e),
+            "ms": int((time.time() - t0) * 1000),
+        }
+        out["ok"] = False
+        out["hint"] = (
+            "Tableau is reachable but Connected App JWT sign-in failed/timed out. "
+            "Check Connected App enabled, secrets, TABLEAU_SITE_NAME, and firewall."
+        )
+    return out
 
 
 @app.get("/api/workbooks/resolve")

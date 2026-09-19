@@ -10,7 +10,7 @@ import httpx
 import jwt
 
 from backend.auth_context import get_tableau_username
-from backend.config import env, httpx_verify, require_env
+from backend.config import env, httpx_verify, httpx_client, require_env
 
 DEFAULT_REST_VERSION = "3.27"
 
@@ -34,8 +34,8 @@ def _site_content_url() -> str:
     return env("TABLEAU_SITE_NAME")
 
 
-def _client(*, timeout: float = 120.0) -> httpx.Client:
-    return httpx.Client(verify=httpx_verify(), timeout=timeout)
+def _client(*, timeout: float = 120.0):
+    return httpx_client(timeout=timeout)
 
 
 def connected_app_configured() -> bool:

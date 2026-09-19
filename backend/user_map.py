@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from backend.config import env, httpx_verify, require_env
+from backend.config import env, httpx_verify, httpx_client, require_env
 from backend.tableau_auth import (
     connected_app_configured,
     mint_connected_app_jwt,
@@ -157,10 +157,9 @@ def _sign_in_for_user_list() -> tuple[str, str]:
     if connected_app_configured() and sync_user:
         # Always include users:read — fallback scopes without it cannot Query Users.
         token_jwt = mint_connected_app_jwt(sync_user, scopes=_USER_LIST_SCOPES)
-        import httpx
 
         url = f"{_server_base()}/api/{_rest_version()}/auth/signin"
-        with httpx.Client(verify=httpx_verify(), timeout=60.0) as client:
+        with httpx_client(timeout=30.0) as client:
             res = client.post(
                 url,
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
@@ -200,15 +199,13 @@ def _sign_in_for_user_list() -> tuple[str, str]:
 
 def list_site_users() -> list[dict[str, str]]:
     """Return [{id, name, fullName}, ...] for the configured site."""
-    import httpx
-
     token, site_id = _sign_in_for_user_list()
     if not site_id:
         raise RuntimeError("Tableau sign-in returned no site id")
 
     users: list[dict[str, str]] = []
     page = 1
-    with httpx.Client(verify=httpx_verify(), timeout=60.0) as client:
+    with httpx_client(timeout=30.0) as client:
         while True:
             url = (
                 f"{_server_base()}/api/{_rest_version()}/sites/{site_id}/users"

@@ -45,5 +45,14 @@ def env_int(name: str, default: int) -> int:
 
 
 def httpx_verify() -> bool:
-    raw = env("TABLEAU_SSL_VERIFY", "1").lower()
-    return raw not in ("0", "false", "no")
+    # Default off: many Tableau Server installs use a private/self-signed CA
+    # (nunomics.ai fails verify=True). Set TABLEAU_SSL_VERIFY=1 to enforce.
+    raw = env("TABLEAU_SSL_VERIFY", "0").lower()
+    return raw in ("1", "true", "yes")
+
+
+def httpx_client(*, timeout: float = 120.0) -> "httpx.Client":
+    """Tableau HTTP client — ignore HTTP(S)_PROXY so cloud hosts don't hang."""
+    import httpx
+
+    return httpx.Client(verify=httpx_verify(), timeout=timeout, trust_env=False)

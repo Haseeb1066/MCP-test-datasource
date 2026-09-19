@@ -7,7 +7,7 @@ from typing import Any, Literal, TypedDict
 
 import httpx
 
-from backend.config import env, httpx_verify, require_env
+from backend.config import env, httpx_client, require_env
 from backend.tableau_auth import auth_mode, probe_tableau_sign_in, sign_in
 
 # Re-export for callers / health
@@ -48,8 +48,8 @@ def _site_content_url() -> str:
     return env("TABLEAU_SITE_NAME")
 
 
-def _client() -> httpx.Client:
-    return httpx.Client(verify=httpx_verify(), timeout=120.0)
+def _client():
+    return httpx_client(timeout=120.0)
 
 
 def sign_in_pat() -> tuple[str, str]:

@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from backend.config import env, httpx_verify
+from backend.config import env, httpx_client
 from backend.mcp_tableau import call_tool, tool_result_to_text
 from backend.tableau_fields import DEFAULT_REST_VERSION, _server_base, sign_in_pat
 from backend.workbooks import _extract_json_payload, _normalize_label
@@ -300,7 +300,7 @@ def fetch_published_datasource_by_name(name: str) -> DatasourceSummary | None:
         return None
     version = _rest_version()
     url = f"{_server_base()}/api/{version}/sites/{site_id}/datasources"
-    with httpx.Client(verify=httpx_verify(), timeout=120.0) as client:
+    with httpx_client(timeout=120.0) as client:
         res = client.get(
             url,
             headers={
@@ -564,7 +564,7 @@ def fetch_workbook_datasources_rest(workbook_luid: str) -> list[DatasourceSummar
     }
     base = f"{_server_base()}/api/{version}/sites/{site_id}/workbooks/{wid}"
 
-    with httpx.Client(verify=httpx_verify(), timeout=120.0) as client:
+    with httpx_client(timeout=120.0) as client:
         for path in ("datasources", "connections"):
             res = client.get(f"{base}/{path}", headers=headers)
             if not res.is_success:
@@ -590,7 +590,7 @@ def fetch_workbook_published_datasources(workbook_luid: str) -> list[DatasourceS
 
     token, _site_id = sign_in_pat()
     url = f"{_server_base()}/api/metadata/graphql"
-    with httpx.Client(verify=httpx_verify(), timeout=120.0) as client:
+    with httpx_client(timeout=120.0) as client:
         res = client.post(
             url,
             headers={
