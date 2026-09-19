@@ -97,12 +97,36 @@ def _lookup_map(data: dict[str, str], unique_user_id: str) -> str | None:
     return None
 
 
-def get_mapped_username(unique_user_id: str) -> str | None:
+def match_username_from_known_map(unique_user_id: str) -> str | None:
+    """
+    Match uniqueUserId without calling Tableau Query Users.
+
+    Supports:
+    - direct map keys (user LUID or previously learned hash)
+    - hash/name variants of any username already in seed/runtime map
+    """
     uid = (unique_user_id or "").strip()
     if not uid:
         return None
     with _lock:
-        return _lookup_map(_load_map(), uid)
+        data = _load_map()
+    direct = _lookup_map(data, uid)
+    if direct:
+        return direct
+    uid_cf = uid.casefold()
+    for username in {v for v in data.values() if isinstance(v, str) and v.strip()}:
+        if uid_cf == username.casefold():
+            return username
+        if uid in _hash_candidates(username) or uid_cf in {
+            h.casefold() for h in _hash_candidates(username)
+        }:
+            return username
+    return None
+
+
+def get_mapped_username(unique_user_id: str) -> str | None:
+    """Prefer offline seed/runtime map (incl. username hashes) before Query Users."""
+    return match_username_from_known_map(unique_user_id)
 
 
 def remember_user(unique_user_id: str, username: str) -> None:
@@ -297,8 +321,11 @@ def resolve_username(
     sync_default = (env("TABLEAU_JWT_SUB_CLAIM") or "").strip() or None
 
     if uid:
+        # Offline first — seed/runtime map + hash(username). Avoids Render timeouts
+        # when Query Users is slow/blocked but the viewer is a known site user.
         mapped = get_mapped_username(uid)
         if mapped:
+            remember_user(uid, mapped)
             return {
                 "tableauUsername": mapped,
                 "uniqueUserId": uid,
@@ -319,8 +346,8 @@ def resolve_username(
             f"({uid}). "
             "Ensure TABLEAU_JWT_SUB_CLAIM (or admin PAT) can Query Users, "
             "TABLEAU_SSL_VERIFY=0 if the server uses a private CA, "
-            "and the viewer’s uniqueUserId matches a site user LUID "
-            "(add it to data/user_map.seed.json if needed)."
+            "and the viewer’s uniqueUserId matches a site user LUID or "
+            "sha256(username) (add LUID→username to data/user_map.seed.json)."
         )
         out: dict[str, Any] = {
             "tableauUsername": None,
