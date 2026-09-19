@@ -10,3 +10,4 @@ __pycache__
 benchmark-results/
 data/user_map.json
 data/*.tmp
+# data/user_map.seed.json is committed (known LUID → username for deploys)

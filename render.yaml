@@ -8,3 +8,10 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20"
+      # Required for nunomics.ai / private CA Tableau hosts (set also in Render dashboard if not using this file)
+      - key: TABLEAU_SSL_VERIFY
+        value: "0"
+      - key: NODE_TLS_REJECT_UNAUTHORIZED
+        value: "0"
+      # Also set in Render dashboard (secrets): TABLEAU_SERVER, TABLEAU_SITE_NAME,
+      # TABLEAU_CONNECTED_APP_*, TABLEAU_JWT_SUB_CLAIM (site admin for Query Users), OPENAI_API_KEY

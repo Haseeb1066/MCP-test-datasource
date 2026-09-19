@@ -88,8 +88,8 @@ def mint_connected_app_jwt(username: str, *, scopes: list[str] | None = None) ->
     )
 
 
-def sign_in_with_jwt(username: str) -> tuple[str, str]:
-    token_jwt = mint_connected_app_jwt(username)
+def sign_in_with_jwt(username: str, *, scopes: list[str] | None = None) -> tuple[str, str]:
+    token_jwt = mint_connected_app_jwt(username, scopes=scopes)
     url = f"{_server_base()}/api/{_rest_version()}/auth/signin"
     with _client() as client:
         res = client.post(
