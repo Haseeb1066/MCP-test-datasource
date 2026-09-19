@@ -376,7 +376,8 @@ async def api_auth_resolve(
 
     if result.get("resolved") and result.get("tableauUsername"):
         with tableau_user_context(str(result["tableauUsername"])):
-            probe = probe_tableau_sign_in()
+            # Keep resolve snappy on slow hosts (Render → Tableau TLS); don't hang 2 minutes.
+            probe = probe_tableau_sign_in(timeout=20.0)
         result["tableauSignInOk"] = probe.get("tableauSignInOk") is True
         if probe.get("tableauHint"):
             result["tableauHint"] = probe.get("tableauHint")
@@ -384,6 +385,9 @@ async def api_auth_resolve(
             result["tableauError"] = probe.get("tableauError")
         if not result["tableauSignInOk"]:
             result["resolved"] = False
+            # Prefer sign-in failure detail over generic map/query hint.
+            if not result.get("hint"):
+                result["hint"] = result.get("tableauHint") or result.get("tableauError")
     else:
         result["tableauSignInOk"] = False
         result["ignoredClientUsername"] = True

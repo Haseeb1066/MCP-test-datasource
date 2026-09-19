@@ -34,8 +34,8 @@ def _site_content_url() -> str:
     return env("TABLEAU_SITE_NAME")
 
 
-def _client() -> httpx.Client:
-    return httpx.Client(verify=httpx_verify(), timeout=120.0)
+def _client(*, timeout: float = 120.0) -> httpx.Client:
+    return httpx.Client(verify=httpx_verify(), timeout=timeout)
 
 
 def connected_app_configured() -> bool:
@@ -88,10 +88,10 @@ def mint_connected_app_jwt(username: str, *, scopes: list[str] | None = None) ->
     )
 
 
-def sign_in_with_jwt(username: str, *, scopes: list[str] | None = None) -> tuple[str, str]:
+def sign_in_with_jwt(username: str, *, scopes: list[str] | None = None, timeout: float = 120.0) -> tuple[str, str]:
     token_jwt = mint_connected_app_jwt(username, scopes=scopes)
     url = f"{_server_base()}/api/{_rest_version()}/auth/signin"
-    with _client() as client:
+    with _client(timeout=timeout) as client:
         res = client.post(
             url,
             headers={"Accept": "application/json", "Content-Type": "application/json"},
@@ -176,7 +176,7 @@ def sign_in(username: str | None = None) -> tuple[str, str]:
     )
 
 
-def probe_tableau_sign_in() -> dict[str, Any]:
+def probe_tableau_sign_in(*, timeout: float = 20.0) -> dict[str, Any]:
     mode = auth_mode()
     if mode == "none":
         return {
@@ -197,7 +197,7 @@ def probe_tableau_sign_in() -> dict[str, Any]:
                         "(e.g. demoAdmin or local\\demoAdmin), or set TABLEAU_JWT_SUB_CLAIM."
                     ),
                 }
-            sign_in_with_jwt(user)
+            sign_in_with_jwt(user, timeout=timeout)
             return {
                 "tableauSignInOk": True,
                 "authMode": "direct-trust",
@@ -215,7 +215,8 @@ def probe_tableau_sign_in() -> dict[str, Any]:
                 "(2) Domain allowlist is All / includes your server; "
                 "(3) TABLEAU_SITE_NAME matches that site (e.g. demo); "
                 "(4) username matches Tableau login (try demoAdmin and local\\demoAdmin); "
-                "(5) Client ID / Secret ID / Secret Value copied exactly."
+                "(5) Client ID / Secret ID / Secret Value copied exactly; "
+                "(6) On the host set TABLEAU_SSL_VERIFY=0 if Tableau uses a private/self-signed CA."
             )
         else:
             hint = (

@@ -105,6 +105,8 @@ export function App() {
           hint?: string;
           tableauHint?: string;
           tableauError?: string;
+          queryUsersError?: string;
+          uniqueUserId?: string | null;
         }>(res);
 
         if (cancelled) return;
@@ -116,10 +118,15 @@ export function App() {
           setIdentityError(null);
         } else {
           setIdentityError(
-            data.tableauHint ||
-              data.hint ||
-              data.tableauError ||
-              "Could not map your Tableau session to a site user."
+            [
+              data.tableauHint,
+              data.queryUsersError,
+              data.hint,
+              data.tableauError,
+              "Could not map your Tableau session to a site user.",
+            ]
+              .filter(Boolean)
+              .join(" — ")
           );
         }
       } catch (e) {

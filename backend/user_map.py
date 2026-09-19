@@ -318,10 +318,12 @@ def resolve_username(
                 "resolved": True,
             }
         hint = (
-            "Could not resolve Tableau username from uniqueUserId. "
+            "Could not resolve Tableau username from uniqueUserId "
+            f"({uid}). "
             "Ensure TABLEAU_JWT_SUB_CLAIM (or admin PAT) can Query Users, "
             "TABLEAU_SSL_VERIFY=0 if the server uses a private CA, "
-            "and the viewer’s uniqueUserId matches a site user LUID."
+            "and the viewer’s uniqueUserId matches a site user LUID "
+            "(add it to data/user_map.seed.json if needed)."
         )
         out: dict[str, Any] = {
             "tableauUsername": None,
